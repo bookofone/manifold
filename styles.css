@@ -1733,6 +1733,25 @@ body {
   background: #D97757;
   animation: cond-pulse 1.2s ease-in-out infinite;
 }
+/* Blocked: waiting on a human, and it will wait forever. Amber, not orange —
+   distinct from the accent so it reads as "act on me", not "I'm busy". */
+.cond-agent-blocked {
+  border-color: #b8860b;
+  background: #241f14;
+}
+.cond-agent-dot.blocked {
+  background: #e8b339;
+  animation: none;
+  box-shadow: 0 0 0 3px rgba(232, 179, 57, 0.18);
+}
+.cond-agent-blocked .cond-agent-status { color: #e8b339; }
+.cond-blocked-notice {
+  border-color: #b8860b;
+  background: #241f14;
+}
+.cond-blocked-notice .cond-done-dot { background: #e8b339; }
+.cond-blocked-notice b { color: #e8b339; }
+
 .cond-agent-id { font-size: 11px; color: #d0d0d0; }
 .cond-agent-status {
   font-size: 10px;

@@ -693,9 +693,13 @@ function renderRoster(pane, agents) {
   for (const a of agents) {
     const st = a.state || a.status || 'unknown';
     seen.set(a.id, st);
-    if (pane.rosterInit && st === 'done' && pane.agentStates.get(a.id) !== 'done') {
-      condAgentDone(pane, a);
-    }
+    const prev = pane.agentStates.get(a.id);
+    if (!pane.rosterInit) continue;
+    if (st === 'done' && prev !== 'done') condAgentDone(pane, a);
+    // Verified: an agent that asks a question and waits reports 'blocked', and
+    // stays there indefinitely. Nothing frees it but a human, so it is the one
+    // state worth interrupting for.
+    else if (st === 'blocked' && prev !== 'blocked') condAgentBlocked(pane, a);
   }
   pane.agentStates = seen;
   pane.rosterInit = true;
@@ -722,6 +726,10 @@ function renderRoster(pane, agents) {
 
   agents = pane.showDone ? agents : liveAgents;
 
+  // Anything waiting on a human floats to the top of the column.
+  const rank = (a) => ((a.state || a.status) === 'blocked' ? 0 : 1);
+  agents = agents.slice().sort((x, y) => rank(x) - rank(y));
+
   pane.rosterEmpty.textContent = doneAgents.length && !pane.showDone
     ? 'Nothing running.'
     : 'No background agents.\nAsk the conductor to dispatch one, or hit +.';
@@ -734,14 +742,16 @@ function renderRoster(pane, agents) {
 
     // status/state come straight from the CLI; render whatever it says rather
     // than assuming a fixed enum.
-    const status = a.status || a.state || 'unknown';
-    const busy = status !== 'idle' && a.state !== 'done';
+    const status = a.state || a.status || 'unknown';
+    const isBlocked = status === 'blocked';
+    const busy = !isBlocked && status !== 'idle' && status !== 'done';
+    if (isBlocked) card.classList.add('cond-agent-blocked');
 
     card.innerHTML = `
       <div class="cond-agent-top">
-        <span class="cond-agent-dot ${busy ? 'busy' : ''}"></span>
+        <span class="cond-agent-dot ${isBlocked ? 'blocked' : busy ? 'busy' : ''}"></span>
         <span class="cond-agent-id">${escHtml(a.id || '')}</span>
-        <span class="cond-agent-status">${escHtml(String(status))}</span>
+        <span class="cond-agent-status">${isBlocked ? 'needs you' : escHtml(String(status))}</span>
       </div>
       <div class="cond-agent-name">${escHtml(a.name || '(no prompt)')}</div>
       <div class="cond-agent-feed" data-id="${escAttr(a.id)}"></div>
@@ -856,6 +866,21 @@ async function clearFinishedAgents(pane) {
   condSysLine(pane, `Cleared ${done.length} finished agent${done.length === 1 ? '' : 's'}.`);
   showToast(`Cleared ${done.length} agent${done.length === 1 ? '' : 's'}`);
   refreshRoster(pane);
+}
+
+// An agent is waiting on an answer. Unlike a completion this will never resolve
+// on its own, so it is louder, and clicking it attaches so you can reply.
+function condAgentBlocked(pane, agent) {
+  const div = document.createElement('div');
+  div.className = 'cond-done cond-blocked-notice';
+  div.innerHTML = `<span class="cond-done-dot"></span>agent <b>${escHtml(agent.id)}</b> needs you \u2014 ${escHtml(agent.name || '')}`;
+  div.title = 'Click to attach and answer';
+  div.addEventListener('click', () => attachAgentTab(pane, agent));
+  pane.log.appendChild(div);
+  condScroll(pane);
+
+  pane.pendingNotices.push(`[Manifold] Background agent ${agent.id} ("${agent.name || ''}") is BLOCKED waiting for a human answer. It will not continue until someone replies.`);
+  showToast(`Agent ${agent.id} needs you`, true);
 }
 
 function attachAgentTab(pane, agent) {
