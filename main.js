@@ -67,10 +67,12 @@ function createWindow() {
     // Wait for renderer to confirm save, with a safety timeout
     ipcMain.once('save-state-done', () => {
       destroyAllTerminals();
+      destroyAllConductors();
       mainWindow.destroy();
     });
     setTimeout(() => {
       destroyAllTerminals();
+      destroyAllConductors();
       mainWindow.destroy();
     }, 2000);
   });
@@ -979,6 +981,465 @@ ipcMain.handle('ssh-setup', async (event, { host, port, username, password, tail
   return { ok: false, error: 'Key was copied but auth verification failed', cmd };
 });
 
+// ── Conductor & background agents ──
+//
+// The conductor is a Claude Code session driven over stream-json instead of a
+// pty: messages go in as JSON on stdin, events come back as JSONL on stdout.
+// One process holds one conversation across many turns (verified: context
+// survives), so the renderer can keep an input box live while a turn is still
+// running and drain queued messages as the process frees up.
+//
+// Its tool surface is deliberately narrow. Note that --allowedTools is an
+// auto-approve list, NOT a restriction — the session still loads every tool — so
+// the editing tools are denied outright via --disallowedTools, Bash is
+// auto-approved only for `claude ...`, and --permission-prompts none means
+// anything else is refused rather than hanging on a prompt nobody can answer.
+// The conductor delegates; it is not supposed to edit anything itself.
+
+const conductors = new Map();
+
+
+// GUI launches get a minimal PATH, so `claude` is usually not on it — same
+// problem the Tailscale lookup solves, same fix: probe known locations and
+// keep the first that answers.
+const CLAUDE_PATHS = [
+  path.join(os.homedir(), '.local', 'bin', 'claude'),
+  '/opt/homebrew/bin/claude',
+  '/usr/local/bin/claude',
+  '/usr/bin/claude',
+  'claude', // PATH lookup — covers Linux/WSL and custom installs
+];
+
+let claudeBinCache;
+async function findClaudeBin() {
+  if (claudeBinCache !== undefined) return claudeBinCache;
+  for (const bin of CLAUDE_PATHS) {
+    const probe = await runCmd(bin, ['--version'], { timeout: 5000 });
+    if (probe.ok) { claudeBinCache = bin; return bin; }
+  }
+  claudeBinCache = null;
+  return null;
+}
+
+// Claude Code refuses to nest: if Manifold was itself launched from a session,
+// these leak in and the child thinks it's a subagent.
+function claudeEnv() {
+  const env = { ...process.env, HOME: os.homedir() };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  return env;
+}
+
+// The conductor runs with permissions bypassed, matching every other Claude
+// session Manifold spawns (see TOOL_CMD). Allowlisting was tried and abandoned:
+// patterns like `Bash(claude *)` don't match compound commands, so ordinary work
+// (`for id in ...; do claude logs $id; done`) got denied with no way to approve
+// it. Dispatched agents get the same treatment — see conductorPrompt.
+//
+// The conductor also gets an addressable session name so dispatched agents can
+// message it back when they finish, instead of the work completing silently and
+// only surfacing when the user thinks to ask.
+function conductorPrompt(selfName) {
+  return [
+    'You are the conductor of a Manifold workspace.',
+    '',
+    'Your session is named "' + selfName + '". Background agents can reach you at',
+    'that name with the SendMessage tool.',
+    '',
+    'You do not do heavy work yourself. Your job is to stay responsive and delegate:',
+    '',
+    '- Dispatch background work with:',
+    '    claude --bg --dangerously-skip-permissions "<full self-contained prompt>"',
+    '  The flag is required: without it the agent stalls on approval prompts that',
+    '  nobody can answer.',
+    '  Run it with cwd set to the project directory. It returns a short session id.',
+    '  ALWAYS append this sentence to a dispatched prompt, so the work reports back',
+    '  instead of finishing silently:',
+    '    "When you are completely finished, use SendMessage to send a one-paragraph',
+    '     summary of what you did to the session named ' + selfName + '."',
+    '- Inspect running work with the ListAgents tool, or claude agents --json.',
+    '  Prefer those for status. `claude logs <id>` replays raw terminal output',
+    '  (spinner frames and all) and is often over 100KB, so use it only when you',
+    '  actually need to see what an agent printed.',
+    '- Read a session\'s output with: claude logs <id>',
+    '- Stop one with: claude stop <id>',
+    '- Delete a finished one with: claude rm <id>. This clears it from the roster',
+    '  and removes its worktree. Only works once the session has exited, so stop it',
+    '  first if it is still running. The user can also delete agents from the',
+    '  sidebar, so the roster may change without you doing anything.',
+    '',
+    'When an agent messages you that it finished, relay the result to the user',
+    'straight away in one or two sentences.',
+    '',
+    'Keep your own replies short. When you dispatch something, say what you dispatched',
+    'and give the id. When asked for status, check with the tools rather than guessing.',
+    'A background agent\'s prompt must be fully self-contained: it does not see this',
+    'conversation.',
+  ].join('\n');
+}
+
+ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, name }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found. Install it to use a conductor.' };
+
+  // Unique per conductor so two of them never answer to the same address, but
+  // stable across restarts: the renderer persists this and hands it back, so an
+  // agent dispatched before a restart can still reach the conductor afterwards.
+  const selfName = name || `manifold-conductor-${String(id).replace(/[^a-zA-Z0-9-]/g, '')}-${crypto.randomUUID().slice(0, 4)}`;
+  const dir = cwd || os.homedir();
+
+  const send = (msg) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('conductor-event', { id, msg });
+    }
+  };
+
+  // A conductor only gets a transcript once a turn completes, so a tab closed
+  // before its first message leaves a session id that resolves to nothing.
+  // `--resume` on a missing id is fatal (exit 1, "No conversation found"), so
+  // check the file rather than letting a stale id kill the pane.
+  let resumeId = null;
+  if (sessionId) {
+    const f = path.join(getProjectDir(dir), sessionId + '.jsonl');
+    if (fs.existsSync(f)) resumeId = sessionId;
+    else send({ type: 'manifold_notice', text: 'Previous conversation not found on disk — starting fresh.' });
+  }
+
+  const { spawn } = require('child_process');
+
+  const launch = (withResume) => {
+    const args = [
+      '-p',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--model', model || 'sonnet',
+      '--name', selfName,
+      '--dangerously-skip-permissions',
+      '--append-system-prompt', conductorPrompt(selfName),
+    ];
+    // Resuming reuses the same session id and carries the conversation, so a
+    // restarted conductor still remembers what was said.
+    if (withResume) args.push('--resume', withResume);
+
+    const proc = spawn(bin, args, { cwd: dir, env: claudeEnv() });
+    let sawInit = false;
+    let stderrTail = '';
+
+    // stdout is JSONL, but a frame can be split across chunks — buffer to newline.
+    let buf = '';
+    proc.stdout.on('data', (chunk) => {
+      buf += chunk;
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); }
+        catch (_) { continue; /* non-JSON noise on stdout — ignore */ }
+        // An agent reporting back arrives as a user turn. Classify it here so
+        // the live feed and the replayed history use one implementation.
+        if (msg.type === 'user') {
+          const c = (msg.message || {}).content;
+          const text = typeof c === 'string' ? c
+            : Array.isArray(c) ? c.filter((b) => b.type === 'text' && b.text).map((b) => b.text).join('\n')
+            : '';
+          const cls = classifyConductorTurn(text);
+          if (cls && cls.role === 'agent') {
+            send({ type: 'manifold_agent_msg', from: cls.from, text: cls.text });
+          }
+        }
+        if (msg.type === 'system' && msg.subtype === 'init') {
+          sawInit = true;
+          if (msg.session_id) {
+            const c = conductors.get(id);
+            if (c) c.sessionId = msg.session_id;
+          }
+        }
+        send(msg);
+      }
+    });
+
+    proc.stderr.on('data', (d) => {
+      const text = String(d);
+      stderrTail = (stderrTail + text).slice(-1000);
+      send({ type: 'manifold_error', text: text.slice(0, 2000) });
+    });
+
+    proc.on('exit', (code) => {
+      // Died before it ever came up while resuming: the session is unusable, so
+      // fall back to a fresh one instead of leaving the pane dead.
+      if (withResume && !sawInit) {
+        send({ type: 'manifold_notice', text: 'Could not resume that conversation — starting fresh.' });
+        // The turn that was in flight died with the process. Without this the
+        // renderer stays "busy" forever and every later message piles up behind
+        // a turn that will never finish.
+        send({ type: 'manifold_reset' });
+        const fresh = launch(null);
+        const c = conductors.get(id);
+        if (c) { c.proc = fresh; c.sessionId = null; }
+        return;
+      }
+      conductors.delete(id);
+      send({ type: 'manifold_exit', code });
+    });
+
+    proc.on('error', (err) => {
+      send({ type: 'manifold_error', text: err.message });
+    });
+
+    return proc;
+  };
+
+  const proc = launch(resumeId);
+  conductors.set(id, { proc, cwd: dir, selfName, sessionId: resumeId });
+  return { ok: true, selfName, resumed: !!resumeId };
+});
+
+ipcMain.handle('conductor-send', (event, { id, text }) => {
+  const c = conductors.get(id);
+  if (!c) return { ok: false, error: 'Conductor not running' };
+  const frame = {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  };
+  try {
+    c.proc.stdin.write(JSON.stringify(frame) + '\n');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Preempt the running turn. The CLI advertises interrupt_receipt_v1 and answers
+// a control_request with {subtype:'success', response:{still_queued:[...]}}, so a
+// new message can take over instead of waiting behind the old one.
+let conductorReqSeq = 0;
+ipcMain.handle('conductor-interrupt', (event, { id }) => {
+  const c = conductors.get(id);
+  if (!c) return { ok: false, error: 'Conductor not running' };
+  const frame = {
+    type: 'control_request',
+    request_id: `manifold_${++conductorReqSeq}`,
+    request: { subtype: 'interrupt' },
+  };
+  try {
+    c.proc.stdin.write(JSON.stringify(frame) + '\n');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.on('conductor-destroy', (event, { id }) => {
+  const c = conductors.get(id);
+  if (!c) return;
+  try { c.proc.stdin.end(); } catch (_) {}
+  try { c.proc.kill(); } catch (_) {}
+  conductors.delete(id);
+});
+
+ipcMain.handle('conductor-get-session-id', (event, { id }) => {
+  const c = conductors.get(id);
+  return c ? (c.sessionId || null) : null;
+});
+
+// Not every `user` turn in a conductor transcript came from the person. Agents
+// reporting back arrive as user turns wrapped in a <cross-session-message>
+// envelope, and background-task notices arrive as <task-notification>. Replaying
+// those as user bubbles made it look like the person had said them — in one real
+// session, 28 "you" bubbles for 15 actual messages.
+function classifyConductorTurn(text) {
+  const t = String(text || '').trim();
+  if (!t) return null;
+
+  const xs = t.match(/<cross-session-message\b[^>]*from-name="([^"]*)"[^>]*>([\s\S]*?)(?:<\/cross-session-message>|$)/);
+  if (xs) return { role: 'agent', from: xs[1], text: xs[2].trim() };
+
+  if (/^<task-notification\b/.test(t)) return { role: 'system', text: 'background task notification' };
+  if (/^<[a-z-]+>/i.test(t) && /<\/[a-z-]+>/i.test(t)) return { role: 'system', text: t.slice(0, 120) };
+
+  // Completion notices are piggybacked onto the next message; the person didn't
+  // type them, so show only what they actually wrote.
+  const stripped = t.replace(/^(?:\[Manifold\][^\n]*\n?)+\s*/, '').trim();
+  if (!stripped) return { role: 'system', text: t.slice(0, 120) };
+  return { role: 'user', text: stripped };
+}
+
+// Rebuild a restored pane's feed from the session transcript on disk. The
+// conversation is already persisted by Claude Code, so there is no reason to
+// duplicate it into Manifold's state file.
+ipcMain.handle('conductor-history', (event, { sessionId, cwd }) => {
+  if (!sessionId || !cwd) return { ok: false, entries: [] };
+  const file = path.join(getProjectDir(cwd), sessionId + '.jsonl');
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf-8'); }
+  catch (_) { return { ok: false, entries: [] }; }
+
+  const entries = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let m;
+    try { m = JSON.parse(line); } catch (_) { continue; }
+    const content = m.message && m.message.content;
+
+    if (m.type === 'user') {
+      // Tool results are plumbing, not conversation — they carry no text block
+      // and fall out here naturally.
+      let text = '';
+      if (typeof content === 'string') text = content;
+      else if (Array.isArray(content)) {
+        text = content.filter((b) => b.type === 'text' && b.text).map((b) => b.text).join('\n');
+      }
+      const c = classifyConductorTurn(text);
+      if (c && c.role !== 'system') entries.push(c);
+    } else if (m.type === 'assistant' && Array.isArray(content)) {
+      for (const b of content) {
+        if (b.type === 'text' && b.text && b.text.trim()) entries.push({ role: 'assistant', text: b.text });
+        else if (b.type === 'tool_use') entries.push({ role: 'tool', name: b.name, input: b.input });
+      }
+    }
+  }
+
+  // Long-running conductors accumulate; replaying everything would stall the
+  // pane on open, so keep the tail.
+  const MAX = 200;
+  return { ok: true, entries: entries.slice(-MAX), truncated: entries.length > MAX };
+});
+
+function destroyAllConductors() {
+  for (const [, c] of conductors) {
+    try { c.proc.stdin.end(); } catch (_) {}
+    try { c.proc.kill(); } catch (_) {}
+  }
+  conductors.clear();
+}
+
+// ── Background agent roster ──
+
+ipcMain.handle('agents-list', async (event, { cwd }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+
+  // --cwd scopes the listing to sessions started under this collection's path.
+  const args = ['agents', '--json'];
+  if (cwd) args.push('--cwd', cwd);
+
+  const res = await runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+  if (!res.ok) return { ok: false, error: res.stderr || 'agents --json failed' };
+  try {
+    return { ok: true, agents: JSON.parse(res.stdout || '[]') };
+  } catch (_) {
+    return { ok: false, error: 'Could not parse agents listing' };
+  }
+});
+
+ipcMain.handle('agent-dispatch', async (event, { cwd, prompt, model }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+
+  // --bg takes the prompt as the positional argument; pairing it with -p is
+  // rejected ("the job would be unattachable"), which is the whole point here —
+  // a dispatched agent has to stay attachable.
+  const args = ['--bg', '--dangerously-skip-permissions', prompt];
+  if (model) args.push('--model', model);
+
+  const res = await runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 30000 });
+  if (!res.ok) return { ok: false, error: res.stderr || 'dispatch failed' };
+
+  // --bg prints a banner then a hint block:
+  //   backgrounded \u00b7 9661d8d4
+  //     claude agents             list sessions
+  //     claude attach 9661d8d4    open in this terminal
+  // Pull the id off the banner; fall back to the attach hint if that changes.
+  const out = (res.stdout || '').trim();
+  const id = (out.match(/backgrounded\s*\u00b7\s*(\S+)/) ||
+              out.match(/claude\s+attach\s+(\S+)/) || [])[1] || null;
+  if (!id) return { ok: false, error: 'Dispatched but could not read the session id', raw: out };
+  return { ok: true, id, raw: out };
+});
+
+// Read the last slice of a .jsonl without loading the whole file — these run to
+// 750KB while an agent is working, and this is polled every few seconds.
+function tailJsonl(file, bytes) {
+  const stat = fs.statSync(file);
+  const start = Math.max(0, stat.size - bytes);
+  const len = stat.size - start;
+  if (len <= 0) return [];
+  const fd = fs.openSync(file, 'r');
+  const buf = Buffer.alloc(len);
+  try { fs.readSync(fd, buf, 0, len, start); } finally { fs.closeSync(fd); }
+  let text = buf.toString('utf-8');
+  // A partial first line is unparseable when we started mid-file.
+  if (start > 0) {
+    const nl = text.indexOf('\n');
+    text = nl === -1 ? '' : text.slice(nl + 1);
+  }
+  return text.split('\n').filter((l) => l.trim());
+}
+
+const ACTIVITY_TAIL_BYTES = 48 * 1024;
+
+ipcMain.handle('agents-activity', (event, { agents }) => {
+  const out = {};
+  for (const a of agents || []) {
+    if (!a || !a.sessionId || !a.cwd) continue;
+    const file = path.join(getProjectDir(a.cwd), a.sessionId + '.jsonl');
+    let events = [];
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(file).mtimeMs;
+      for (const line of tailJsonl(file, ACTIVITY_TAIL_BYTES)) {
+        let m;
+        try { m = JSON.parse(line); } catch (_) { continue; }
+        const c = (m.message || {}).content;
+        if (m.type !== 'assistant' || !Array.isArray(c)) continue;
+        for (const b of c) {
+          if (b.type === 'tool_use') {
+            const i = b.input || {};
+            const target = i.file_path || i.command || i.pattern || i.description || '';
+            events.push({ kind: 'tool', name: b.name, target: String(target).slice(0, 120) });
+          } else if (b.type === 'text' && b.text && b.text.trim()) {
+            events.push({ kind: 'text', text: b.text.trim().replace(/\s+/g, ' ').slice(0, 160) });
+          }
+        }
+      }
+    } catch (_) { /* transcript not written yet — agent is still starting */ }
+    out[a.id] = { events: events.slice(-3), mtime };
+  }
+  return out;
+});
+
+ipcMain.handle('agent-logs', async (event, { id, cwd }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  const res = await runCmd(bin, ['logs', id], { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+  return { ok: res.ok, text: res.stdout || res.stderr };
+});
+
+// `claude rm` deletes a session and its worktree. Its help reads like it only
+// handles exited sessions ("Unlike `stop`, works on already-exited sessions"),
+// but it removes a running one too — verified — so no stop step is needed.
+// Its stdout can carry worktree follow-ups (--discard-unpushed /
+// --force-remove-worktree tokens) when it can't finish the job, so the output
+// is handed back rather than swallowed.
+ipcMain.handle('agent-remove', async (event, { id, cwd }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  const opts = { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 15000 };
+
+  const res = await runCmd(bin, ['rm', id], opts);
+  const output = (res.stdout || res.stderr || '').trim();
+  return { ok: res.ok, output, error: res.ok ? null : (output || 'rm failed') };
+});
+
+ipcMain.handle('agent-stop', async (event, { id, cwd }) => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  const res = await runCmd(bin, ['stop', id], { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+  return { ok: res.ok, error: res.ok ? null : (res.stderr || 'stop failed') };
+});
+
 // ── App lifecycle ──
 
 app.whenReady().then(() => {
@@ -1069,4 +1530,5 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   destroyAllTerminals();
+  destroyAllConductors();
 });

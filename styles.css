@@ -1476,3 +1476,414 @@ body {
 #remote-browser-select:hover {
   background: #e08867 !important;
 }
+
+/* ── Conductor pane ─────────────────────────────────────────────────────────
+   Chat thread on the left, background-agent roster on the right. Sized like a
+   .terminal-container so it drops into #terminal-single and .grid-cell alike. */
+
+.conductor-pane {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  display: flex;
+  background: #1a1a1a;
+  font-family: "Share Tech Mono", monospace;
+}
+
+.cond-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cond-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Feed entries must never compress. Anything with a non-visible overflow
+   (the tool chips, the log dumps) resolves min-height:auto to 0, so the
+   default flex-shrink:1 crushes it as the column fills — tool chips collapsed
+   to 8px and log dumps to 18px. Plain bubbles kept min-height:auto and
+   survived, which is why it only looked broken after a few tool calls. */
+.cond-log > * { flex-shrink: 0; }
+.cond-queue, .cond-input-row { flex-shrink: 0; }
+
+.cond-msg {
+  max-width: 78%;
+  padding: 8px 11px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cond-msg-user {
+  align-self: flex-end;
+  background: #D97757;
+  color: #1a1a1a;
+}
+.cond-msg-assistant {
+  align-self: flex-start;
+  background: #242424;
+  color: #d0d0d0;
+  border: 1px solid #333;
+}
+.cond-msg-agent {
+  align-self: flex-start;
+  background: #1c2620;
+  color: #c8d6cc;
+  border: 1px solid #2f4438;
+  border-left: 3px solid #4e9a68;
+}
+.cond-msg-from {
+  font-size: 10px;
+  color: #4e9a68;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+
+.cond-msg-logs {
+  align-self: stretch;
+  max-width: 100%;
+  background: #141414;
+  border: 1px solid #2c2c2c;
+  color: #9a9a9a;
+  font-size: 11px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.cond-sys {
+  align-self: center;
+  font-size: 11px;
+  color: #6a6a6a;
+  letter-spacing: 0.04em;
+}
+.cond-sys-error { color: #cc6666; }
+
+.cond-tool {
+  align-self: flex-start;
+  font-size: 11px;
+  color: #8a8a8a;
+  background: #1e1e1e;
+  border-left: 2px solid #D97757;
+  padding: 4px 9px;
+  max-width: 78%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cond-tool-name { color: #D97757; }
+
+/* Queued messages — proof the input never blocked */
+.cond-queue {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border-top: 1px solid #262626;
+  overflow-x: auto;
+}
+.cond-queue.hidden { display: none; }
+.cond-queue-label {
+  font-size: 10px;
+  color: #6a6a6a;
+  letter-spacing: 0.1em;
+  flex-shrink: 0;
+}
+.cond-queue-chip {
+  font-size: 11px;
+  color: #b0b0b0;
+  background: #232323;
+  border: 1px dashed #3a3a3a;
+  border-radius: 4px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.cond-queue-clear {
+  background: none;
+  border: none;
+  color: #6a6a6a;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.cond-queue-clear:hover { color: #e5484d; }
+
+.cond-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 16px 14px;
+  border-top: 1px solid #262626;
+}
+.cond-input {
+  flex: 1;
+  resize: none;
+  background: #202020;
+  border: 1px solid #333;
+  border-radius: 6px;
+  color: #d0d0d0;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 9px 11px;
+  line-height: 1.4;
+  outline: none;
+  overflow-y: auto;
+}
+.cond-input:focus { border-color: #D97757; }
+.cond-send {
+  background: #D97757;
+  color: #1a1a1a;
+  border: none;
+  border-radius: 6px;
+  width: 34px;
+  height: 34px;
+  font-size: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.cond-send:hover { background: #e08a6d; }
+
+/* Busy = a turn is in flight. The input stays live regardless. */
+.cond-busy .cond-send {
+  background: #3a3a3a;
+  color: #8a8a8a;
+  animation: cond-pulse 1.2s ease-in-out infinite;
+}
+@keyframes cond-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* ── Roster ── */
+
+.cond-roster {
+  width: 260px;
+  flex-shrink: 0;
+  border-left: 1px solid #262626;
+  display: flex;
+  flex-direction: column;
+  background: #171717;
+}
+.cond-roster-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 12px;
+  border-bottom: 1px solid #262626;
+}
+.cond-roster-title {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: #6a6a6a;
+}
+.cond-dispatch-btn {
+  background: none;
+  border: 1px solid #3a3a3a;
+  color: #D97757;
+  border-radius: 4px;
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cond-dispatch-btn:hover { border-color: #D97757; }
+
+.cond-roster-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; }
+.cond-roster-empty {
+  padding: 16px 14px;
+  font-size: 11px;
+  color: #5a5a5a;
+  line-height: 1.6;
+}
+.cond-roster-empty.hidden { display: none; }
+
+.cond-agent {
+  background: #1e1e1e;
+  border: 1px solid #2c2c2c;
+  border-radius: 5px;
+  padding: 8px 9px;
+  margin-bottom: 7px;
+}
+.cond-agent-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+}
+.cond-agent-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4a4a4a;
+  flex-shrink: 0;
+}
+.cond-agent-dot.busy {
+  background: #D97757;
+  animation: cond-pulse 1.2s ease-in-out infinite;
+}
+.cond-agent-id { font-size: 11px; color: #d0d0d0; }
+.cond-agent-status {
+  font-size: 10px;
+  color: #6a6a6a;
+  margin-left: auto;
+}
+.cond-agent-name {
+  font-size: 11px;
+  color: #8a8a8a;
+  line-height: 1.4;
+  margin-bottom: 7px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Per-agent activity, tailed from its transcript. Kept to three lines so a
+   working agent reads at a glance without the column turning into a log. */
+.cond-agent-feed {
+  margin: 0 0 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cond-feed-line {
+  font-size: 10px;
+  line-height: 1.35;
+  color: #7a7a7a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cond-feed-tool { color: #D97757; }
+.cond-feed-dim { color: #5f5f5f; font-style: italic; }
+
+/* Finished agents are hidden by default; this reveals them. */
+.cond-done-toggle {
+  background: none;
+  border: 1px solid #3a3a3a;
+  color: #6a6a6a;
+  border-radius: 4px;
+  height: 20px;
+  padding: 0 7px;
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  margin-left: auto;
+  margin-right: 6px;
+}
+.cond-done-toggle.hidden { display: none; }
+.cond-done-toggle:hover { border-color: #6a6a6a; color: #9a9a9a; }
+.cond-done-toggle.on { border-color: #D97757; color: #D97757; }
+
+.cond-agent-actions { display: flex; gap: 5px; }
+.cond-agent-btn {
+  flex: 1;
+  background: #262626;
+  border: none;
+  border-radius: 3px;
+  color: #9a9a9a;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.cond-agent-btn:hover { background: #333; color: #D97757; }
+
+/* Roster header: clear-finished sits next to dispatch. */
+.cond-clear-btn {
+  background: none;
+  border: 1px solid #3a3a3a;
+  color: #8a8a8a;
+  border-radius: 4px;
+  height: 20px;
+  padding: 0 7px;
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  margin-left: auto;
+  margin-right: 6px;
+}
+.cond-clear-btn:hover:not(:disabled) { border-color: #e5484d; color: #e5484d; }
+.cond-done-toggle.hidden + .cond-clear-btn { margin-left: auto; }
+.cond-clear-btn:disabled { opacity: 0.35; cursor: default; }
+
+/* Per-agent delete. Narrow, so the three word-buttons keep their width. */
+.cond-agent-del {
+  flex: 0 0 22px;
+  color: #6a6a6a;
+}
+.cond-agent-del:hover { background: #3a2526; color: #e5484d; }
+
+/* Agent-finished notice in the feed. Clickable: jumps straight to attaching. */
+.cond-done {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: #d0d0d0;
+  background: #24201e;
+  border: 1px solid #D97757;
+  border-radius: 5px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.cond-done:hover { background: #2d2724; }
+.cond-done b { color: #D97757; font-weight: normal; }
+.cond-done-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #D97757; flex-shrink: 0;
+}
+
+/* Grid cells are short — drop the roster and tighten the thread */
+.grid-cell .cond-roster { display: none; }
+.grid-cell .cond-log { padding: 8px 10px; }
+.grid-cell .cond-msg { font-size: 11px; max-width: 92%; }
+
+/* ── Cursor: one shape, two states ───────────────────────────────────────────
+   A 12px dot over inert surfaces; a 20px ring over anything that will respond.
+   The ring is nearly twice the dot because it promises something will happen.
+   Both carry opposing outlines (white on black, black on white) so they stay
+   legible on the dark chrome and on a bright terminal alike. A red X marks the
+   destructive controls. Wrapped in pointer:fine so touch devices never load it,
+   and every value falls back to a native cursor after the comma. */
+@media (pointer: fine) {
+  :root {
+    --cursor-dot:  url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><circle cx='6' cy='6' r='5' fill='%23fff' stroke='%23000' stroke-width='1'/></svg>") 6 6, auto;
+    --cursor-ring: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'><circle cx='10' cy='10' r='8.5' fill='none' stroke='%23000' stroke-width='3'/><circle cx='10' cy='10' r='8.5' fill='none' stroke='%23fff' stroke-width='1.5'/></svg>") 10 10, pointer;
+    --cursor-x:    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'><g fill='none' stroke-linecap='round'><path d='M6 6L14 14M14 6L6 14' stroke='%23000' stroke-width='3.5'/><path d='M6 6L14 14M14 6L6 14' stroke='%23e5484d' stroke-width='1.5'/></g></svg>") 10 10, not-allowed;
+  }
+
+  html { cursor: var(--cursor-dot); }
+
+  a, button, [role="button"], input, textarea, select, label, summary,
+  .tab-row, .collection-header, .add-menu-item, .collection-menu-item,
+  .grid-cell-header, .cond-agent, .cond-done, .row-drag {
+    cursor: var(--cursor-ring);
+  }
+
+  /* Destructive: closing a session, deleting a collection, wiping state. */
+  .row-close, .collection-btn-del, .grid-cell-close,
+  .remote-row-btn-del, .settings-row-btn-nuke,
+  .cond-agent-btn.act-stop, .cond-agent-del, .cond-clear-btn:not(:disabled),
+  .cond-queue-clear {
+    cursor: var(--cursor-x);
+  }
+
+  /* The terminal keeps a native I-beam: selection is a primary interaction
+     there, and a 20px ring hides the character grid you are aiming at. */
+  .xterm, .xterm-screen, .xterm-viewport, .xterm-helper-textarea {
+    cursor: text;
+  }
+}

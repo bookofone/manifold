@@ -9,7 +9,7 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
 | File | Role |
 |------|------|
 | `main.js` | Electron main process: window, IPC, node-pty terminals, state persistence |
-| `preload.js` | Context bridge — exposes `claude` IPC API to renderer. **Do not edit** (overwritten on reload) |
+| `preload.js` | Context bridge — exposes the `manifold` IPC API to the renderer. Edit when adding IPC |
 | `renderer.js` | All client-side logic: collections, tabs, grid view, keybindings, auto-naming |
 | `styles.css` | Dark theme, layout, grid |
 | `index.html` | HTML shell |
@@ -20,6 +20,21 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
 - **Terminals**: `node-pty` spawns, tracked in `Map` by tab ID
 - **Conversations**: Detected by watching `~/.claude/projects/<encoded-path>/*.jsonl`
 - **IPC**: All renderer↔main communication through `preload.js` bridge
+- **Conductor**: A tab with `provider: 'conductor'` is *not* a pty. It drives a long-lived
+  `claude -p --input-format stream-json --output-format stream-json` process, so its input box
+  never blocks on a turn — messages queue in the renderer and drain as the process frees up.
+  It registers a shim in `terminalInstances` (`isConductor: true`) so the existing show/hide/
+  grid/close paths work unchanged.
+- **Background agents**: `claude --bg --dangerously-skip-permissions "<task>"` dispatches
+  (prompt is positional — `-p` is rejected), `claude agents --json` lists,
+  `attach`/`logs`/`stop` manage. The roster filters to `kind === 'background'`: interactive
+  sessions are listed too but carry no short `id`. It polls every 4s for visible conductor
+  panes and raises a notice when an agent transitions to `done`; "attach" spawns a normal
+  pty tab running `claude attach <id>`, promoting a background agent to a full TUI.
+- **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
+  dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
+  was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work
+  was denied with no approval surface available.
 
 ## Style
 

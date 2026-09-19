@@ -51,6 +51,7 @@ function getActiveTab() {
 function fitTerminal(tabId) {
   const inst = terminalInstances.get(tabId);
   if (!inst) return;
+  if (inst.isConductor) return; // no pty, no cols/rows — CSS handles the layout
   inst.fitAddon.fit();
   manifold.resizeTerminal(tabId, inst.terminal.cols, inst.terminal.rows);
   scrollTerminalToBottom(inst);
@@ -207,6 +208,13 @@ function createTerminalInstance(tabId, cwd, conversationId, name, collectionName
 
 // ── Terminal cleanup ──
 function destroyTerminalInstance(tabId) {
+  if (terminalInstances.get(tabId)?.isConductor) {
+    destroyConductorPane(tabId);
+    terminalInstances.delete(tabId);
+    lastDataTime.delete(tabId);
+    terminalAlive.delete(tabId);
+    return;
+  }
   manifold.destroyTerminal(tabId);
   pendingWrites.delete(tabId);
   hiddenBuffers.delete(tabId);
@@ -325,6 +333,629 @@ manifold.onTerminalData((id, data) => {
   }
 });
 
+// ── Conductor pane ──
+//
+// A conductor tab is not a pty. It talks to a long-lived `claude` process over
+// stream-json, which means the input box is never blocked by a turn in flight:
+// messages go into a local queue and drain as the process frees up. That is the
+// whole point — one always-open thread you talk to, while the real work happens
+// in detached background agents listed in the roster alongside it.
+
+const conductorPanes = new Map(); // tabId -> pane state
+
+function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null) {
+  const el = document.createElement('div');
+  el.className = 'conductor-pane';
+  el.innerHTML = `
+    <div class="cond-main">
+      <div class="cond-log"></div>
+      <div class="cond-queue hidden"></div>
+      <form class="cond-input-row">
+        <textarea class="cond-input" rows="1" placeholder="Message the conductor — always open, never blocks" spellcheck="false"></textarea>
+        <button type="submit" class="cond-send" title="Send">${'↵'}</button>
+      </form>
+    </div>
+    <div class="cond-roster">
+      <div class="cond-roster-head">
+        <span class="cond-roster-title">SUBCONSCIOUS</span>
+        <button class="cond-done-toggle hidden" title="Show or hide finished agents"></button>
+        <button class="cond-clear-btn" title="Delete every finished agent">clear</button>
+        <button class="cond-dispatch-btn" title="Dispatch a background agent">+</button>
+      </div>
+      <div class="cond-roster-list"></div>
+      <div class="cond-roster-empty">No background agents.<br>Ask the conductor to dispatch one, or hit +.</div>
+    </div>
+  `;
+
+  const pane = {
+    tabId,
+    cwd,
+    element: el,
+    log: el.querySelector('.cond-log'),
+    queueEl: el.querySelector('.cond-queue'),
+    input: el.querySelector('.cond-input'),
+    form: el.querySelector('.cond-input-row'),
+    rosterList: el.querySelector('.cond-roster-list'),
+    rosterEmpty: el.querySelector('.cond-roster-empty'),
+    queue: [],
+    busy: false,
+    started: false,
+    currentTurn: null,
+    selfName: selfName || null,
+    sessionId: sessionId || null,
+    // Completion tracking: agents can finish without saying anything, so the
+    // roster poll watches for the transition itself rather than trusting them.
+    agentStates: new Map(),
+    lastEventAt: Date.now(),
+    rosterInit: false,
+    showDone: false,
+    pendingNotices: [],
+  };
+  conductorPanes.set(tabId, pane);
+
+  // Register a shim in terminalInstances so every existing code path that
+  // shows, hides, grids, highlights or closes a tab works unchanged.
+  terminalInstances.set(tabId, {
+    element: el,
+    isConductor: true,
+    terminal: {
+      focus: () => pane.input.focus(),
+      dispose: () => {},
+      scrollToBottom: () => {},
+    },
+    fitAddon: { fit: () => {} },
+  });
+  terminalAlive.set(tabId, true);
+
+  // Input: Enter sends, Shift+Enter newlines. Never disabled.
+  pane.input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitConductorMessage(pane);
+    }
+    e.stopPropagation(); // don't let app shortcuts eat ordinary typing
+  });
+  pane.input.addEventListener('input', () => {
+    pane.input.style.height = 'auto';
+    pane.input.style.height = Math.min(pane.input.scrollHeight, 160) + 'px';
+  });
+  pane.form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitConductorMessage(pane);
+  });
+
+  el.querySelector('.cond-dispatch-btn').addEventListener('click', () => dispatchAgentPrompt(pane));
+  el.querySelector('.cond-clear-btn').addEventListener('click', () => clearFinishedAgents(pane));
+  el.querySelector('.cond-done-toggle').addEventListener('click', () => {
+    pane.showDone = !pane.showDone;
+    refreshRoster(pane);
+  });
+
+  // A restored tab replays its transcript first, so the feed doesn't come back
+  // blank while the process is still starting.
+  if (sessionId) replayConductorHistory(pane, sessionId);
+  startConductor(pane, name);
+  refreshRoster(pane);
+
+  return { terminal: null, fitAddon: null, element: el };
+}
+
+async function replayConductorHistory(pane, sessionId) {
+  const res = await manifold.conductorHistory(sessionId, pane.cwd);
+  if (!res || !res.ok || !res.entries.length) return;
+  if (res.truncated) condSysLine(pane, '…earlier history trimmed');
+  for (const e of res.entries) {
+    if (e.role === 'tool') condToolChip(pane, e.name, e.input);
+    else if (e.role === 'agent') condAgentBubble(pane, e.from, e.text);
+    else condBubble(pane, e.role, e.text);
+  }
+  condSysLine(pane, `── resumed · ${res.entries.length} earlier messages ──`);
+}
+
+async function startConductor(pane, name) {
+  condSysLine(pane, pane.sessionId ? 'Resuming conductor…' : `Starting conductor in ${pane.cwd}…`);
+  const res = await manifold.conductorCreate({
+    id: pane.tabId, cwd: pane.cwd, model: 'sonnet',
+    sessionId: pane.sessionId, name: pane.selfName,
+  });
+  if (!res || !res.ok) {
+    condSysLine(pane, `Failed to start: ${(res && res.error) || 'unknown error'}`, true);
+    terminalAlive.set(pane.tabId, false);
+    return;
+  }
+  pane.started = true;
+  pane.selfName = res.selfName || null;
+}
+
+// ── Sending: queue in, drain as the process frees up ──
+
+function submitConductorMessage(pane) {
+  const text = pane.input.value.trim();
+  if (!text) return;
+  pane.input.value = '';
+  pane.input.style.height = 'auto';
+
+  condBubble(pane, 'user', text);
+
+  // Piggyback unreported agent completions onto this message. The bubble above
+  // shows only what the user typed; the conductor gets the notices too, so it
+  // knows without anyone burning a turn to tell it.
+  let outgoing = text;
+  if (pane.pendingNotices.length > 0) {
+    outgoing = pane.pendingNotices.join('\n') + '\n\n' + text;
+    pane.pendingNotices = [];
+  }
+  pane.queue.push(outgoing);
+  renderQueue(pane);
+  preemptAndDrain(pane);
+}
+
+// The point of the conductor is that it always answers, so a message never waits
+// behind the previous one: if a turn is running it gets interrupted and the new
+// message goes straight out. The queue below only holds a message for the few
+// milliseconds an interrupt is in flight.
+async function preemptAndDrain(pane) {
+  if (pane.busy) {
+    condSysLine(pane, '\u26a1 interrupted the previous turn');
+    const res = await manifold.conductorInterrupt(pane.tabId);
+    if (!res || !res.ok) condSysLine(pane, `Interrupt failed: ${(res && res.error) || '?'}`, true);
+    pane.busy = false;
+    setConductorBusy(pane, false);
+  }
+  drainConductorQueue(pane);
+}
+
+async function drainConductorQueue(pane) {
+  if (pane.busy || pane.queue.length === 0) return;
+  const text = pane.queue.shift();
+  renderQueue(pane);
+  pane.busy = true;
+  setConductorBusy(pane, true);
+
+  const res = await manifold.conductorSend(pane.tabId, text);
+  if (!res || !res.ok) {
+    condSysLine(pane, `Send failed: ${(res && res.error) || 'conductor not running'}`, true);
+    pane.busy = false;
+    setConductorBusy(pane, false);
+  }
+}
+
+function renderQueue(pane) {
+  if (pane.queue.length === 0) {
+    pane.queueEl.classList.add('hidden');
+    pane.queueEl.innerHTML = '';
+    return;
+  }
+  pane.queueEl.classList.remove('hidden');
+  pane.queueEl.innerHTML = `<span class="cond-queue-label">queued</span>` +
+    pane.queue.map((q) => `<span class="cond-queue-chip">${escHtml(q.slice(0, 60))}</span>`).join('') +
+    `<button class="cond-queue-clear" title="Discard queued messages">\u2715</button>`;
+  pane.queueEl.querySelector('.cond-queue-clear').addEventListener('click', () => {
+    pane.queue = [];
+    renderQueue(pane);
+    condSysLine(pane, 'Queue cleared.');
+  });
+}
+
+function setConductorBusy(pane, busy) {
+  pane.element.classList.toggle('cond-busy', busy);
+  lastDataTime.set(pane.tabId, Date.now());
+}
+
+// ── Rendering ──
+
+function condScroll(pane) {
+  pane.log.scrollTop = pane.log.scrollHeight;
+}
+
+function condBubble(pane, role, text) {
+  const div = document.createElement('div');
+  div.className = `cond-msg cond-msg-${role}`;
+  div.textContent = text;
+  pane.log.appendChild(div);
+  condScroll(pane);
+  return div;
+}
+
+// Agent reports arrive as user turns in the transcript. Rendering them as user
+// bubbles made the replay look like the person had said them, so they get their
+// own shape with the sender's name on it.
+function condAgentBubble(pane, from, text) {
+  const div = document.createElement('div');
+  div.className = 'cond-msg cond-msg-agent';
+  const label = document.createElement('div');
+  label.className = 'cond-msg-from';
+  label.textContent = from || 'agent';
+  const body = document.createElement('div');
+  body.textContent = text;
+  div.appendChild(label);
+  div.appendChild(body);
+  pane.log.appendChild(div);
+  condScroll(pane);
+}
+
+function condSysLine(pane, text, isError) {
+  const div = document.createElement('div');
+  div.className = 'cond-sys' + (isError ? ' cond-sys-error' : '');
+  div.textContent = text;
+  pane.log.appendChild(div);
+  condScroll(pane);
+}
+
+function condToolChip(pane, name, input) {
+  const div = document.createElement('div');
+  div.className = 'cond-tool';
+  let detail = '';
+  if (input && typeof input === 'object') {
+    detail = input.command || input.description || JSON.stringify(input);
+  }
+  div.innerHTML = `<span class="cond-tool-name">${escHtml(name)}</span> <span class="cond-tool-detail">${escHtml(String(detail).slice(0, 180))}</span>`;
+  pane.log.appendChild(div);
+  condScroll(pane);
+}
+
+manifold.onConductorEvent((tabId, msg) => {
+  const pane = conductorPanes.get(tabId);
+  if (!pane) return;
+  lastDataTime.set(tabId, Date.now());
+  pane.lastEventAt = Date.now();
+
+  switch (msg.type) {
+    case 'system':
+      // init re-fires on every turn, not just the first — only announce once.
+      if (msg.session_id) pane.sessionId = msg.session_id;
+      if (msg.subtype === 'init' && !pane.announced) {
+        pane.announced = true;
+        condSysLine(pane, `Conductor ready — ${msg.model || 'claude'} · session ${String(msg.session_id || '').slice(0, 8)}`);
+      }
+      break;
+
+    case 'assistant': {
+      const blocks = (msg.message && msg.message.content) || [];
+      for (const b of blocks) {
+        if (b.type === 'text' && b.text.trim()) condBubble(pane, 'assistant', b.text);
+        else if (b.type === 'tool_use') condToolChip(pane, b.name, b.input);
+      }
+      break;
+    }
+
+    case 'result':
+      pane.busy = false;
+      setConductorBusy(pane, false);
+      if (msg.is_error) condSysLine(pane, `Turn failed: ${msg.subtype || 'error'}`, true);
+      // A turn finishing is the cue to re-check what the subconscious is doing.
+      refreshRoster(pane);
+      drainConductorQueue(pane);
+      break;
+
+    case 'rate_limit_event': {
+      const w = msg.rate_limit_info && msg.rate_limit_info.unifiedWindows;
+      if (w && w.five_hour) {
+        const pct = Math.round((w.five_hour.utilization || 0) * 100);
+        const title = pane.element.querySelector('.cond-roster-title');
+        if (title) title.textContent = `SUBCONSCIOUS · ${pct}% 5h`;
+      }
+      break;
+    }
+
+    // The process was replaced under us; whatever turn was running is gone.
+    case 'manifold_reset':
+      pane.busy = false;
+      setConductorBusy(pane, false);
+      drainConductorQueue(pane);
+      break;
+
+    case 'manifold_agent_msg':
+      condAgentBubble(pane, msg.from, msg.text);
+      break;
+
+    case 'manifold_notice':
+      condSysLine(pane, msg.text);
+      break;
+
+    case 'manifold_error':
+      condSysLine(pane, msg.text, true);
+      break;
+
+    case 'manifold_exit':
+      condSysLine(pane, `Conductor exited (code ${msg.code}).`, true);
+      terminalAlive.set(tabId, false);
+      pane.busy = false;
+      setConductorBusy(pane, false);
+      renderQueue(pane);
+      break;
+  }
+});
+
+// ── Roster: the subconscious ──
+
+async function refreshRoster(pane) {
+  const res = await manifold.agentsList(pane.cwd);
+  if (!res || !res.ok) {
+    pane.rosterEmpty.textContent = (res && res.error) || 'Could not list agents.';
+    pane.rosterEmpty.classList.remove('hidden');
+    pane.rosterList.innerHTML = '';
+    return;
+  }
+  renderRoster(pane, res.agents || []);
+}
+
+function renderRoster(pane, agents) {
+  // `claude agents --json` lists interactive sessions too — including this
+  // conductor itself — and those have no short `id`, only a pid/sessionId.
+  // Attaching to them is meaningless (they're already attached) and produced
+  // `claude attach undefined`. The subconscious is background sessions only.
+  agents = agents.filter((a) => a.kind === 'background' && a.id);
+
+  // Watch for work finishing. An agent that wasn't told to report back just goes
+  // quiet, so the poll detects the transition and surfaces it here.
+  const seen = new Map();
+  for (const a of agents) {
+    const st = a.state || a.status || 'unknown';
+    seen.set(a.id, st);
+    if (pane.rosterInit && st === 'done' && pane.agentStates.get(a.id) !== 'done') {
+      condAgentDone(pane, a);
+    }
+  }
+  pane.agentStates = seen;
+  pane.rosterInit = true;
+  pane.agents = agents; // full list — bulk actions must see finished ones too
+
+  // Finished agents are noise once you've read the completion notice, so the
+  // roster shows live work only. `blocked` counts as live — that's the one that
+  // most needs attention.
+  const isDone = (a) => (a.state || a.status) === 'done';
+  const doneAgents = agents.filter(isDone);
+  const liveAgents = agents.filter((a) => !isDone(a));
+
+  const clearBtn = pane.element.querySelector('.cond-clear-btn');
+  if (clearBtn) {
+    clearBtn.textContent = doneAgents.length ? `clear ${doneAgents.length}` : 'clear';
+    clearBtn.disabled = doneAgents.length === 0;
+  }
+  const doneBtn = pane.element.querySelector('.cond-done-toggle');
+  if (doneBtn) {
+    doneBtn.textContent = doneAgents.length ? `${doneAgents.length} done` : '';
+    doneBtn.classList.toggle('hidden', doneAgents.length === 0);
+    doneBtn.classList.toggle('on', !!pane.showDone);
+  }
+
+  agents = pane.showDone ? agents : liveAgents;
+
+  pane.rosterEmpty.textContent = doneAgents.length && !pane.showDone
+    ? 'Nothing running.'
+    : 'No background agents.\nAsk the conductor to dispatch one, or hit +.';
+  pane.rosterEmpty.classList.toggle('hidden', agents.length > 0);
+  pane.rosterList.innerHTML = '';
+
+  for (const a of agents) {
+    const card = document.createElement('div');
+    card.className = 'cond-agent';
+
+    // status/state come straight from the CLI; render whatever it says rather
+    // than assuming a fixed enum.
+    const status = a.status || a.state || 'unknown';
+    const busy = status !== 'idle' && a.state !== 'done';
+
+    card.innerHTML = `
+      <div class="cond-agent-top">
+        <span class="cond-agent-dot ${busy ? 'busy' : ''}"></span>
+        <span class="cond-agent-id">${escHtml(a.id || '')}</span>
+        <span class="cond-agent-status">${escHtml(String(status))}</span>
+      </div>
+      <div class="cond-agent-name">${escHtml(a.name || '(no prompt)')}</div>
+      <div class="cond-agent-feed" data-id="${escAttr(a.id)}"></div>
+      <div class="cond-agent-actions">
+        <button class="cond-agent-btn act-attach">attach</button>
+        <button class="cond-agent-btn act-logs">logs</button>
+        <button class="cond-agent-btn act-stop">stop</button>
+        <button class="cond-agent-btn cond-agent-del act-del" title="Delete this agent">✕</button>
+      </div>
+    `;
+
+    // Attach promotes a background agent into a real TUI tab — the handoff from
+    // watching to driving, which is the one thing the terminal does better.
+    card.querySelector('.act-attach').addEventListener('click', () => attachAgentTab(pane, a));
+    card.querySelector('.act-logs').addEventListener('click', async () => {
+      const r = await manifold.agentLogs(a.id, pane.cwd);
+      condSysLine(pane, `── logs ${a.id} ──`);
+      condBubble(pane, 'logs', (r && r.text) || '(no output)');
+    });
+    card.querySelector('.act-del').addEventListener('click', () => removeAgent(pane, a, busy));
+    card.querySelector('.act-stop').addEventListener('click', async () => {
+      const r = await manifold.agentStop(a.id, pane.cwd);
+      condSysLine(pane, r && r.ok ? `Stopped ${a.id}.` : `Stop failed: ${(r && r.error) || '?'}`, !(r && r.ok));
+      refreshRoster(pane);
+    });
+
+    pane.rosterList.appendChild(card);
+  }
+
+  renderAgentActivity(pane, agents);
+}
+
+// What each agent is actually doing, tailed from its own transcript. `claude
+// logs` would replay raw terminal output (spinner frames, 100KB+); the .jsonl is
+// already structured, so this reads the last few tool calls and lines instead.
+async function renderAgentActivity(pane, agents) {
+  const live = agents
+    .filter((a) => a.sessionId && (a.state || a.status) !== 'done')
+    .map((a) => ({ id: a.id, sessionId: a.sessionId, cwd: a.cwd || pane.cwd }));
+  if (!live.length) return;
+
+  const res = await manifold.agentsActivity(live);
+  if (!res) return;
+
+  for (const [id, info] of Object.entries(res)) {
+    const el = pane.rosterList.querySelector(`.cond-agent-feed[data-id="${CSS.escape(id)}"]`);
+    if (!el) continue;
+    if (!info.events || !info.events.length) {
+      el.innerHTML = '<div class="cond-feed-line cond-feed-dim">starting\u2026</div>';
+      continue;
+    }
+    el.innerHTML = info.events.map((e) => (
+      e.kind === 'tool'
+        ? `<div class="cond-feed-line"><span class="cond-feed-tool">${escHtml(e.name)}</span> ${escHtml(shortTarget(e.target))}</div>`
+        : `<div class="cond-feed-line cond-feed-dim">${escHtml(e.text)}</div>`
+    )).join('');
+  }
+}
+
+// Long absolute paths swamp a 260px column — the basename is the useful part.
+function shortTarget(t) {
+  if (!t) return '';
+  if (t.includes('/') && !t.includes(' ')) return t.split('/').slice(-2).join('/');
+  return t.length > 64 ? t.slice(0, 64) + '\u2026' : t;
+}
+
+// An agent finished. Show it immediately, and hold the note so the conductor
+// picks it up on the user's next message.
+function condAgentDone(pane, agent) {
+  const div = document.createElement('div');
+  div.className = 'cond-done';
+  div.innerHTML = `<span class="cond-done-dot"></span>agent <b>${escHtml(agent.id)}</b> finished \u2014 ${escHtml(agent.name || '')}`;
+  div.title = 'Click to attach';
+  div.addEventListener('click', () => attachAgentTab(pane, agent));
+  pane.log.appendChild(div);
+  condScroll(pane);
+
+  pane.pendingNotices.push(`[Manifold] Background agent ${agent.id} ("${agent.name || ''}") has finished.`);
+  showToast(`Agent ${agent.id} finished`);
+}
+
+// Deleting a finished agent is one click: it is a spent session and a cluttered
+// roster is the thing being fixed. `claude rm` will happily remove a running
+// session too, so one that is still working asks first — that discards
+// in-flight work.
+async function removeAgent(pane, agent, isBusy) {
+  if (isBusy) {
+    const ok = await showConfirmDialog(`Stop and delete "${agent.name || agent.id}"? It is still working.`, 'Stop & delete');
+    if (!ok) return;
+  }
+  const res = await manifold.agentRemove({ id: agent.id, cwd: agent.cwd || pane.cwd });
+  if (!res || !res.ok) {
+    condSysLine(pane, `Could not delete ${agent.id}: ${(res && res.error) || '?'}`, true);
+  } else {
+    // rm reports worktree follow-ups when it cannot finish the job — surface
+    // those instead of pretending the delete was clean.
+    const extra = (res.output || '').includes('--') ? ` \u2014 ${res.output}` : '';
+    condSysLine(pane, `Deleted ${agent.id}${extra}`);
+  }
+  pane.agentStates.delete(agent.id);
+  refreshRoster(pane);
+}
+
+async function clearFinishedAgents(pane) {
+  const done = (pane.agents || []).filter((a) => (a.state || a.status) === 'done');
+  if (!done.length) return;
+  for (const a of done) {
+    const res = await manifold.agentRemove({ id: a.id, cwd: a.cwd || pane.cwd });
+    if (!res || !res.ok) condSysLine(pane, `Could not delete ${a.id}: ${(res && res.error) || '?'}`, true);
+    pane.agentStates.delete(a.id);
+  }
+  condSysLine(pane, `Cleared ${done.length} finished agent${done.length === 1 ? '' : 's'}.`);
+  showToast(`Cleared ${done.length} agent${done.length === 1 ? '' : 's'}`);
+  refreshRoster(pane);
+}
+
+function attachAgentTab(pane, agent) {
+  if (!agent || !agent.id) {
+    showToast('That session has no attachable id', true);
+    return;
+  }
+  let ci = -1;
+  for (let c = 0; c < state.collections.length; c++) {
+    if (state.collections[c].tabs.some((t) => t.id === pane.tabId)) { ci = c; break; }
+  }
+  if (ci === -1) return;
+  const col = state.collections[ci];
+
+  const wasGridded = col.gridded;
+  if (wasGridded) hideGridView();
+
+  const tabId = genTabId();
+  const cmd = `claude attach ${agent.id}`;
+  const name = `▸ ${agent.id}`;
+  const dir = agent.cwd || pane.cwd;
+
+  col.tabs.push({ id: tabId, name, cwd: dir, cmd });
+  createTerminalInstance(tabId, dir, null, name, col.name, null, false, cmd);
+
+  col.expanded = true;
+  selectTab(ci, col.tabs.length - 1);
+  renderCollections();
+  if (wasGridded) showGridView(ci);
+  saveState();
+}
+
+async function dispatchAgentPrompt(pane) {
+  const prompt = await showInputDialog('Dispatch background agent', 'Self-contained task for the agent...');
+  if (!prompt) return;
+  condSysLine(pane, `Dispatching: ${prompt.slice(0, 80)}…`);
+  const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: 'sonnet' });
+  if (!res || !res.ok) {
+    condSysLine(pane, `Dispatch failed: ${(res && res.error) || '?'}`, true);
+    return;
+  }
+  condSysLine(pane, `Dispatched → ${res.id}`);
+  refreshRoster(pane);
+}
+
+// Backstop. Interrupting on send means the queue should never sit, but if a turn
+// dies in a way that emits no frame at all, this stops the pane wedging shut.
+const CONDUCTOR_STALL_MS = 120000;
+setInterval(() => {
+  for (const [, pane] of conductorPanes) {
+    if (!pane.busy) continue;
+    if (Date.now() - pane.lastEventAt < CONDUCTOR_STALL_MS) continue;
+    condSysLine(pane, 'No response for 2 minutes \u2014 releasing the turn.', true);
+    pane.busy = false;
+    setConductorBusy(pane, false);
+    drainConductorQueue(pane);
+  }
+}, 5000);
+
+// Roster poll — only for panes that are actually on screen.
+setInterval(() => {
+  for (const [tabId, pane] of conductorPanes) {
+    if (isTerminalVisible(tabId)) refreshRoster(pane);
+  }
+}, 4000);
+
+function destroyConductorPane(tabId) {
+  const pane = conductorPanes.get(tabId);
+  if (!pane) return;
+  manifold.conductorDestroy(tabId);
+  if (pane.element.parentNode) pane.element.parentNode.removeChild(pane.element);
+  conductorPanes.delete(tabId);
+}
+
+function addConductor(ci) {
+  const col = state.collections[ci];
+  if (!col) return;
+  if (col.remote) {
+    showToast('Conductor runs locally — not available on remote collections', true);
+    return;
+  }
+
+  const wasGridded = col.gridded;
+  if (wasGridded) hideGridView();
+
+  const tabId = genTabId();
+  const dir = col.path;
+  const name = `Conductor ${col.tabs.length + 1}`;
+
+  col.tabs.push({ id: tabId, name, cwd: dir, provider: 'conductor' });
+  createConductorPane(tabId, dir, name);
+
+  col.expanded = true;
+  selectTab(ci, col.tabs.length - 1);
+  renderCollections();
+
+  if (wasGridded) showGridView(ci);
+  saveState();
+}
+
 // ── Collection rendering ──
 function renderCollections() {
   collectionsList.innerHTML = '';
@@ -348,6 +979,7 @@ function renderCollections() {
               <button class="add-menu-item add-btn" data-ci="${ci}"><span class="add-menu-icon">&#x2726;</span> Claude</button>
               <button class="add-menu-item copilot-btn" data-ci="${ci}"><span class="add-menu-icon">&#x2708;</span> Copilot</button>
               <button class="add-menu-item term-btn" data-ci="${ci}"><span class="add-menu-icon">&gt;_</span> Terminal</button>
+              <button class="add-menu-item conductor-btn" data-ci="${ci}"><span class="add-menu-icon">&#x25C9;</span> Conductor</button>
               ${(col.commands || []).map((cmd, cmdI) => `<button class="add-menu-item cmd-btn" data-ci="${ci}" data-cmdi="${cmdI}" title="${escAttr(cmd.cmd)}"><span class="add-menu-icon">&#x26A1;</span> ${escHtml(cmd.name)}</button>`).join('')}
               <button class="add-menu-item addcmd-btn" data-ci="${ci}"><span class="add-menu-icon">+</span> Add command</button>
             </div>
@@ -578,6 +1210,8 @@ function bindCollectionEvents() {
         addCopilot(ci);
       } else if (el.classList.contains('term-btn')) {
         addTerminal(ci);
+      } else if (el.classList.contains('conductor-btn')) {
+        addConductor(ci);
       } else if (el.classList.contains('cmd-btn')) {
         const cmdI = parseInt(el.dataset.cmdi);
         const col = state.collections[ci];
@@ -827,6 +1461,45 @@ function showInputDialog(title, placeholder) {
       if (e.key === 'Enter') cleanup(field.value.trim() || null);
       if (e.key === 'Escape') cleanup(null);
     };
+  });
+}
+
+// Same overlay as showInputDialog, with the text field hidden — a confirm that
+// looks like the rest of the app rather than a native browser box.
+function showConfirmDialog(title, okLabel = 'Delete') {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('input-dialog-overlay');
+    const titleEl = document.getElementById('input-dialog-title');
+    const field = document.getElementById('input-dialog-field');
+    const okBtn = document.getElementById('input-dialog-ok');
+    const cancelBtn = document.getElementById('input-dialog-cancel');
+    const okText = okBtn.textContent;
+
+    titleEl.textContent = title;
+    field.style.display = 'none';
+    okBtn.textContent = okLabel;
+    overlay.classList.remove('hidden');
+    okBtn.focus();
+
+    function cleanup(val) {
+      overlay.classList.add('hidden');
+      field.style.display = '';   // restore for showInputDialog
+      okBtn.textContent = okText;
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+      overlay.onclick = null;
+      document.removeEventListener('keydown', onKey, true);
+      resolve(val);
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); cleanup(false); }
+      if (e.key === 'Enter') { e.stopPropagation(); cleanup(true); }
+    }
+
+    okBtn.onclick = () => cleanup(true);
+    cancelBtn.onclick = () => cleanup(false);
+    overlay.onclick = (e) => { if (e.target === overlay) cleanup(false); };
+    document.addEventListener('keydown', onKey, true);
   });
 }
 
@@ -1132,7 +1805,7 @@ async function saveState() {
   // Conversation IDs are cached on tab objects by the activity poll.
   // Only fetch for tabs that still lack one (e.g. freshly spawned).
   const allTabs = state.collections.flatMap(col => col.tabs);
-  const missing = allTabs.filter(t => !t.conversationId && !t.shell && !t.cmd && t.provider !== 'copilot' && !t.remote);
+  const missing = allTabs.filter(t => !t.conversationId && !t.shell && !t.cmd && t.provider !== 'copilot' && t.provider !== 'conductor' && !t.remote);
   if (missing.length > 0) {
     const results = await Promise.all(
       missing.map(tab => manifold.getConversationId(tab.id).catch(() => null))
@@ -1154,6 +1827,8 @@ async function saveState() {
         name: t.name,
         cwd: t.cwd,
         conversationId: t.conversationId || null,
+        conductorSessionId: conductorPanes.get(t.id)?.sessionId || t.conductorSessionId || null,
+        conductorName: conductorPanes.get(t.id)?.selfName || t.conductorName || null,
         provider: t.provider || 'claude',
         copilotSessionId: t.copilotSessionId || null,
         shell: t.shell || false,
@@ -1588,7 +2263,8 @@ function updateAllDots() {
 
 // ── Activity polling ──
 setInterval(async () => {
-  const tabIds = [...terminalInstances.keys()];
+  const tabIds = [...terminalInstances.keys()]
+    .filter(id => !terminalInstances.get(id)?.isConductor);
   const results = await Promise.all(
     tabIds.map(id => manifold.isTerminalActive(id).catch(() => false))
   );
@@ -2372,7 +3048,11 @@ async function restoreFromState(data) {
         cmd: tabData.cmd || null,
         remote: tabRemote,
       });
-      createTerminalInstance(tabId, cwd, isNonClaude ? null : (tabData.conversationId || null), tabData.name || 'Session', col.name, null, tabData.shell || false, tabData.cmd || null, provider, copilotSessionId, provider === 'copilot' && !!copilotSessionId, tabRemote);
+      if (provider === 'conductor') {
+        createConductorPane(tabId, cwd, tabData.name || 'Conductor', tabData.conductorSessionId || null, tabData.conductorName || null);
+      } else {
+        createTerminalInstance(tabId, cwd, isNonClaude ? null : (tabData.conversationId || null), tabData.name || 'Session', col.name, null, tabData.shell || false, tabData.cmd || null, provider, copilotSessionId, provider === 'copilot' && !!copilotSessionId, tabRemote);
+      }
     }
 
     state.collections.push(col);
