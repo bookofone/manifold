@@ -20,6 +20,11 @@ const state = {
   gridCollection: null,
   defaultSource: 'claude', // 'claude' | 'copilot' | 'terminal' — what Ctrl/Cmd+T launches
   remotes: [], // { name, host, defaultPath }
+  // What a conductor does the moment it opens, before you type anything:
+  // 'orient'  — a fresh one surveys the project; a resumed one checks the roster
+  // 'catchup' — resumed ones catch up, fresh ones stay quiet
+  // 'off'     — never speak first
+  conductorBirth: 'orient',
 };
 
 // Terminal instances: tabId -> { terminal, fitAddon, element }
@@ -433,6 +438,7 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
 
   // A restored tab replays its transcript first, so the feed doesn't come back
   // blank while the process is still starting.
+  pane.resumedFrom = sessionId || null;
   if (sessionId) replayConductorHistory(pane, sessionId);
   startConductor(pane, name);
   refreshRoster(pane);
@@ -465,6 +471,38 @@ async function startConductor(pane, name) {
   }
   pane.started = true;
   pane.selfName = res.selfName || null;
+  condSysLine(pane, res.resumed ? 'Conductor resumed.' : 'Conductor ready.');
+  conductorBirthMessage(pane);
+}
+
+// A conductor that opens silently makes you prime it before it is useful. A
+// fresh one surveys where it has been born; a resumed one checks what happened
+// while it was down — agents finish, block and die during a restart, and it has
+// no other way to learn that.
+const CONDUCTOR_BIRTH_PROMPTS = {
+  fresh: (cwd) => `You have just been started in ${cwd}. Orient yourself: what is this project (language, framework, what it does), and what state is it in (git status if it is a repo, anything obviously in progress)? Answer in a few sentences. Do not edit anything and do not dispatch agents.`,
+  resumed: () => 'You have just been restarted. Check the background agent roster and report anything that finished, is blocked, or changed while you were down. A few sentences. Do not dispatch anything.',
+};
+
+function conductorBirthMessage(pane) {
+  if (pane.birthSent) return;
+  pane.birthSent = true;
+
+  const mode = state.conductorBirth || 'orient';
+  if (mode === 'off') return;
+
+  // pane.sessionId is set before start when a tab is restored, so it is the
+  // signal for "this conductor has been here before".
+  const resumed = !!pane.resumedFrom;
+  if (!resumed && mode === 'catchup') return;
+
+  const text = resumed
+    ? CONDUCTOR_BIRTH_PROMPTS.resumed()
+    : CONDUCTOR_BIRTH_PROMPTS.fresh(pane.cwd);
+
+  condSysLine(pane, resumed ? 'Catching up\u2026' : 'Orienting\u2026');
+  pane.queue.push(text);
+  preemptAndDrain(pane);
 }
 
 // ── Sending: queue in, drain as the process frees up ──
@@ -606,6 +644,7 @@ manifold.onConductorEvent((tabId, msg) => {
       if (msg.session_id) pane.sessionId = msg.session_id;
       if (msg.subtype === 'init' && !pane.announced) {
         pane.announced = true;
+        conductorBirthMessage(pane);
         condSysLine(pane, `Conductor ready — ${msg.model || 'claude'} · session ${String(msg.session_id || '').slice(0, 8)}`);
       }
       break;
@@ -1874,6 +1913,7 @@ async function saveState() {
     activeTab: state.activeTabIdx,
     uiScale: parseInt(scaleSlider.value) || 100,
     defaultSource: state.defaultSource,
+    conductorBirth: state.conductorBirth,
     remotes: state.remotes,
   };
   await manifold.saveState(data);
@@ -2438,6 +2478,22 @@ defaultSourceSeg.querySelectorAll('.seg-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     state.defaultSource = btn.dataset.source;
     renderDefaultSource();
+    saveState();
+  });
+});
+
+const conductorBirthSeg = document.getElementById('conductor-birth-seg');
+
+function renderConductorBirth() {
+  conductorBirthSeg.querySelectorAll('.seg-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.birth === (state.conductorBirth || 'orient'));
+  });
+}
+
+conductorBirthSeg.querySelectorAll('.seg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    state.conductorBirth = btn.dataset.birth;
+    renderConductorBirth();
     saveState();
   });
 });
@@ -3124,6 +3180,10 @@ async function restoreFromState(data) {
     if (savedState && savedState.defaultSource) {
       state.defaultSource = savedState.defaultSource;
     }
+    if (savedState && savedState.conductorBirth) {
+      state.conductorBirth = savedState.conductorBirth;
+    }
+    renderConductorBirth();
     // Restore remote destinations
     if (savedState && savedState.remotes) {
       state.remotes = savedState.remotes;
