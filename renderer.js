@@ -955,7 +955,7 @@ function destroyConductorPane(tabId) {
   conductorPanes.delete(tabId);
 }
 
-function addConductor(ci) {
+function addConductor(ci, cwd = null) {
   const col = state.collections[ci];
   if (!col) return;
   if (col.remote) {
@@ -967,7 +967,7 @@ function addConductor(ci) {
   if (wasGridded) hideGridView();
 
   const tabId = genTabId();
-  const dir = col.path;
+  const dir = cwd || col.path;
   const name = `Conductor ${col.tabs.length + 1}`;
 
   col.tabs.push({ id: tabId, name, cwd: dir, provider: 'conductor' });
@@ -1384,6 +1384,15 @@ function addDefaultSession(ci, cwd = null) {
   switch (state.defaultSource) {
     case 'copilot': return addCopilot(ci, cwd);
     case 'terminal': return addTerminal(ci, cwd);
+    case 'conductor': {
+      // Conductor is local-only. On a remote collection fall back to a normal
+      // session so Ctrl+T still produces something instead of a dead toast.
+      if (state.collections[ci] && state.collections[ci].remote) {
+        showToast('Conductor is local-only — opened a Claude session instead');
+        return addSession(ci, cwd);
+      }
+      return addConductor(ci, cwd);
+    }
     default: return addSession(ci, cwd);
   }
 }
@@ -2409,7 +2418,7 @@ function populateShortcuts() {
 // ── Default source picker ──
 const defaultSourceSeg = document.getElementById('default-source-seg');
 let headerHintMod = 'Ctrl';
-const SOURCE_LABELS = { claude: 'claude', copilot: 'copilot', terminal: 'terminal' };
+const SOURCE_LABELS = { claude: 'claude', copilot: 'copilot', terminal: 'terminal', conductor: 'conductor' };
 
 function updateHeaderHints() {
   const m = headerHintMod;
