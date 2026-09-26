@@ -5,6 +5,7 @@ const fs = require('fs');
 const pty = require('node-pty');
 const crypto = require('crypto');
 const dns = require('dns');
+const net = require('net');
 const { exec } = require('child_process');
 
 const IS_WIN = process.platform === 'win32';
@@ -1441,7 +1442,8 @@ function transcriptEntries(lines) {
   const pushUser = (text) => {
     const c = classifyConductorTurn(text);
     if (!c || c.role === 'system') return;
-    if (c.role === 'agent' && c.from === MANIFOLD_PEER) entries.push({ role: 'user', text: c.text.replace(MANIFOLD_PREFIX, '') });
+    // agent-send escapes the envelope tag inside the body; undo that for display.
+    if (c.role === 'agent' && c.from === MANIFOLD_PEER) entries.push({ role: 'user', text: c.text.replace(MANIFOLD_PREFIX, '').replace(/<\\(?=\/?cross-session-message)/gi, '<') });
     else entries.push(c);
   };
   for (const line of lines) {
@@ -1646,6 +1648,52 @@ ipcMain.handle('agent-transcript', async (event, { sessionId, cwd, remote }) => 
   const { entries, question } = transcriptEntries(lines);
   const MAX = 300;
   return { ok: true, entries: entries.slice(-MAX), truncated: entries.length > MAX, question, mtime };
+});
+
+// Talk to an agent directly: write the message into its cross-session inbox,
+// the unix socket SendMessage uses, instead of asking the conductor to relay.
+// Each session publishes ~/.claude/sessions/<pid>.json (socket path) and a
+// 0600 key file <pid>.<sha256(socket)>.key holding the token its inbox wants as
+// the first line. Frames are newline-delimited JSON. The from-mode attestation
+// has to be in the envelope: without it a bypass-permissions agent holds the
+// message for review instead of acting on it. There is no ack on the socket;
+// the renderer confirms delivery by finding the text in the transcript.
+function agentInbox(pid, sessionId) {
+  const dir = path.join(os.homedir(), '.claude', 'sessions');
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(path.join(dir, `${pid}.json`), 'utf-8')); } catch (_) {}
+  if (!meta || meta.sessionId !== sessionId) throw new Error('session is not running');
+  try { process.kill(pid, 0); } catch (_) { throw new Error('session is not running'); }
+  const sock = meta.messagingSocketPath;
+  if (!sock) throw new Error('session has no messaging socket');
+  const hash = crypto.createHash('sha256').update(path.resolve(sock)).digest('hex');
+  let key;
+  try { key = JSON.parse(fs.readFileSync(path.join(dir, `${pid}.${hash}.key`), 'utf-8')); } catch (_) {}
+  if (!key || !key.peerToken) throw new Error('no messaging key for this session');
+  return { sock, token: key.peerToken };
+}
+
+ipcMain.handle('agent-send', async (event, { pid, sessionId, text, remote }) => {
+  if (remote) return { ok: false, error: 'direct send is local only' };
+  if (!pid || !sessionId || !text) return { ok: false, error: 'missing agent or text' };
+  let inbox;
+  try { inbox = agentInbox(pid, sessionId); } catch (e) { return { ok: false, error: e.message }; }
+  const tag = 'cross-session-message';
+  const body = (MANIFOLD_PREFIX + text).replace(new RegExp(`<(?=/?${tag})`, 'gi'), '<\\');
+  const frames = [
+    { type: 'auth', token: inbox.token },
+    {
+      type: 'user', session_id: sessionId, from: 'manifold', uuid: crypto.randomUUID(), msg_id: crypto.randomUUID(),
+      message: { role: 'user', content: `<${tag} from-name="${MANIFOLD_PEER}" from-mode="bypass">\n${body}\n</${tag}>` },
+    },
+  ];
+  return new Promise((resolve) => {
+    let err = null;
+    const s = net.createConnection({ path: inbox.sock }, () => s.end(frames.map((f) => JSON.stringify(f)).join('\n') + '\n'));
+    s.setTimeout(5000, () => { err = 'timed out'; s.destroy(); });
+    s.on('error', (e) => { err = e.message; });
+    s.on('close', () => resolve(err ? { ok: false, error: err } : { ok: true }));
+  });
 });
 
 ipcMain.handle('agent-logs', async (event, { id, cwd, remote }) => {

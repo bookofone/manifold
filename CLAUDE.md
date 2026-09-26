@@ -43,10 +43,17 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   to that agent: its transcript (`agent-transcript`, same `transcriptEntries` parser as the
   conductor replay) re-read every 3s (10s remote), a header with state badge, time since
   last write, recent tools, and any unanswered AskUserQuestion. The pinned "conductor" card
-  swaps back; the conductor's own log keeps streaming while hidden. There is no direct send:
-  input is *relayed* — a `[Manifold relay]` message tells the conductor to SendMessage the text
-  verbatim to the agent's session name. The bubble stays "pending" until the text appears in
-  the agent transcript, and fails visibly after 2 min or if the conductor exits.
+  swaps back; the conductor's own log keeps streaming while hidden. Input to a *local* agent is
+  sent directly (`agent-send`): main writes it into the agent's cross-session inbox, the unix
+  socket SendMessage uses. The socket path is in `~/.claude/sessions/<pid>.json`, its token in
+  `<pid>.<sha256(socket)>.key`; frames are NDJSON, an `auth` line then a `user` line wrapping the
+  text in `<cross-session-message from-name="Manifold" from-mode="bypass">`. Without that
+  `from-mode` a bypass-permissions agent *holds* the message for review. The agent picks it up
+  at its next step (mid-turn, between tool calls) or at once when idle. Remote agents, or a
+  direct send that errors, fall back to a *relay*: a `[Manifold relay]` message tells the
+  conductor to SendMessage the text verbatim. Either way the bubble stays "pending" until the
+  text appears in the agent transcript, and fails visibly after 2 min (or, for relays, if the
+  conductor exits).
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work

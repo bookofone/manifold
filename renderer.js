@@ -731,7 +731,7 @@ manifold.onConductorEvent((tabId, msg) => {
       break;
 
     case 'manifold_exit':
-      for (const r of pane.relays) if (!r.failed) relayFailed(pane, r, 'conductor exited before relaying');
+      for (const r of pane.relays) if (!r.failed && !r.direct) relayFailed(pane, r, 'conductor exited before relaying');
       condSysLine(pane, `Conductor exited (code ${msg.code}).`, true);
       terminalAlive.set(tabId, false);
       pane.busy = false;
@@ -881,9 +881,11 @@ function renderRoster(pane, agents) {
 // ── Agent chat view ──
 //
 // Clicking a card swaps the chat to that agent's own transcript and routes the
-// input box to it. There is no direct send, so messages are relayed: the
-// conductor is told to pass the text verbatim via SendMessage. The relayed
-// bubble stays "pending" until the text shows up in the agent's transcript.
+// input box to it. Local agents get the text directly in their cross-session
+// inbox (agent-send). Remote agents, or a direct send that errors, fall back to
+// a relay: the conductor is told to pass the text verbatim via SendMessage.
+// Either way the bubble stays "pending" until the text shows up in the agent's
+// transcript.
 
 function targetAgent(pane) {
   return (pane.agents || []).find((a) => a.id === pane.target) || null;
@@ -901,7 +903,7 @@ function selectChatTarget(pane, id) {
   pane.element.classList.toggle('cond-targeting', !!id);
   const a = targetAgent(pane);
   pane.input.placeholder = id
-    ? `Message ${(a && a.name) || id}\u2026 (relayed via conductor)`
+    ? `Message ${(a && a.name) || id}\u2026${pane.remote ? ' (relayed via conductor)' : ''}`
     : 'Message the conductor \u2014 always open, never blocks';
   if (id) {
     condSysLine(pane.av, 'Loading transcript\u2026');
@@ -1003,7 +1005,8 @@ function relayBubble(pane, r) {
 
 function relayTag(r) {
   if (!r.tag) return;
-  r.tag.textContent = r.failed ? `relay failed \u2014 ${r.failed}` : 'relayed via conductor \u00b7 pending';
+  const verb = r.direct ? 'send' : 'relay';
+  r.tag.textContent = r.failed ? `${verb} failed \u2014 ${r.failed}` : r.direct ? 'sent \u00b7 pending' : 'relayed via conductor \u00b7 pending';
   r.el.classList.toggle('cond-msg-relay-failed', !!r.failed);
 }
 
@@ -1011,15 +1014,28 @@ function relayFailed(pane, r, why) {
   r.failed = why;
   if (r.timer) clearTimeout(r.timer);
   relayTag(r);
-  condSysLine(pane, `Relay to ${r.agentId} failed: ${why}`, true);
+  condSysLine(pane, `${r.direct ? 'Message' : 'Relay'} to ${r.agentId} failed: ${why}`, true);
 }
 
-function relayToAgent(pane, text) {
+async function relayToAgent(pane, text) {
   const a = targetAgent(pane);
-  const r = { agentId: pane.target, text };
+  const r = { agentId: pane.target, text, direct: !pane.remote };
   pane.relays.push(r);
   relayBubble(pane, r);
   if (!a) return relayFailed(pane, r, 'agent is no longer in the roster');
+
+  if (r.direct) {
+    const res = await manifold.agentSend({ pid: a.pid, sessionId: a.sessionId, text });
+    if (res && res.ok) {
+      // Accepted by the inbox; the transcript is the only delivery receipt.
+      r.timer = setTimeout(() => { if (pane.relays.includes(r) && !r.failed) relayFailed(pane, r, `not seen in the agent transcript after 2 minutes \u2014 it may be held for review; claude attach ${a.id} to check`); }, 120000);
+      return;
+    }
+    r.direct = false;
+    relayTag(r);
+    condSysLine(pane, `Direct send to ${a.id} failed (${(res && res.error) || 'unknown error'}); relaying via the conductor`, true);
+  }
+
   if (!pane.started || !terminalAlive.get(pane.tabId)) return relayFailed(pane, r, 'conductor is not running');
 
   const name = a.name || a.id;
