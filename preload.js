@@ -54,23 +54,24 @@ contextBridge.exposeInMainWorld('manifold', {
   onMenuSelectAll: (cb) => ipcRenderer.on('menu-select-all', cb),
 
   // Conductor — stream-json Claude session, no pty. Input never blocks on a
-  // turn; the renderer queues and drains.
+  // turn; the renderer queues and drains. A `remote` in the opts runs the whole
+  // thing (and its agents) over ssh on that host instead.
   conductorCreate: (opts) => ipcRenderer.invoke('conductor-create', opts),
   conductorSend: (id, text) => ipcRenderer.invoke('conductor-send', { id, text }),
   conductorInterrupt: (id) => ipcRenderer.invoke('conductor-interrupt', { id }),
   conductorDestroy: (id) => ipcRenderer.send('conductor-destroy', { id }),
   conductorGetSessionId: (id) => ipcRenderer.invoke('conductor-get-session-id', { id }),
-  conductorHistory: (sessionId, cwd) => ipcRenderer.invoke('conductor-history', { sessionId, cwd }),
+  conductorHistory: (sessionId, cwd, remote) => ipcRenderer.invoke('conductor-history', { sessionId, cwd, remote }),
   onConductorEvent: (callback) => {
     ipcRenderer.on('conductor-event', (event, { id, msg }) => callback(id, msg));
   },
 
   // Background agents (claude --bg / agents / logs / stop)
-  agentsList: (cwd) => ipcRenderer.invoke('agents-list', { cwd }),
+  agentsList: (cwd, remote) => ipcRenderer.invoke('agents-list', { cwd, remote }),
   agentDispatch: (opts) => ipcRenderer.invoke('agent-dispatch', opts),
-  agentsActivity: (agents) => ipcRenderer.invoke('agents-activity', { agents }),
-  agentLogs: (id, cwd) => ipcRenderer.invoke('agent-logs', { id, cwd }),
-  agentStop: (id, cwd) => ipcRenderer.invoke('agent-stop', { id, cwd }),
+  agentsActivity: (agents, remote) => ipcRenderer.invoke('agents-activity', { agents, remote }),
+  agentLogs: (id, cwd, remote) => ipcRenderer.invoke('agent-logs', { id, cwd, remote }),
+  agentStop: (id, cwd, remote) => ipcRenderer.invoke('agent-stop', { id, cwd, remote }),
   agentRemove: (opts) => ipcRenderer.invoke('agent-remove', opts),
 
   // UI Scale
