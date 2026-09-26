@@ -1010,6 +1010,7 @@ body {
   background: transparent;
   border-color: transparent;
 }
+.claude-cli-row .remote-row-btns { opacity: 1; }
 .remote-row-btn-del:hover {
   color: #e74c3c;
   border-color: #e74c3c44;

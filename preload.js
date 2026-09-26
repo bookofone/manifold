@@ -41,6 +41,10 @@ contextBridge.exposeInMainWorld('manifold', {
   sshSetup: (opts) => ipcRenderer.invoke('ssh-setup', opts),
   tailscaleStatus: () => ipcRenderer.invoke('tailscale-status'),
 
+  // Claude Code CLI
+  claudeVersion: () => ipcRenderer.invoke('claude-version'),
+  claudeUpdate: () => ipcRenderer.invoke('claude-update'),
+
   // Clipboard — goes through IPC to main process because sandboxed preload
   // scripts don't have access to Electron's clipboard module on Windows.
   clipboardReadText: () => ipcRenderer.invoke('clipboard-read'),

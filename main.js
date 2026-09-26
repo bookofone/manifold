@@ -569,7 +569,7 @@ ipcMain.handle('terminal-get-conversation-id', (event, { id }) => {
 // ── Conversation tracking helpers ──
 
 function getProjectDir(cwd) {
-  const encoded = cwd.replace(/[^a-zA-Z0-9._-]/g, '-');
+  const encoded = cwd.replace(/[^a-zA-Z0-9_-]/g, '-');
   return path.join(os.homedir(), '.claude', 'projects', encoded);
 }
 
@@ -1029,6 +1029,34 @@ function claudeEnv() {
   delete env.CLAUDE_CODE_ENTRYPOINT;
   return env;
 }
+
+// ── Claude Code CLI version / self-update (Settings → About) ──
+
+async function claudeVersion(bin) {
+  const r = await runCmd(bin, ['--version'], { env: claudeEnv(), timeout: 10000 });
+  return r.ok ? (r.stdout.match(/\d+\.\d+\.\d+\S*/) || [r.stdout])[0] : null;
+}
+
+ipcMain.handle('claude-version', async () => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  const version = await claudeVersion(bin);
+  return version ? { ok: true, version } : { ok: false, error: 'Could not read version' };
+});
+
+// Running sessions are left alone — they keep the old binary until reopened.
+ipcMain.handle('claude-update', async () => {
+  const bin = await findClaudeBin();
+  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  const before = await claudeVersion(bin);
+  const r = await runCmd(bin, ['update'], { env: claudeEnv(), timeout: 300000 });
+  claudeBinCache = undefined; // the update may have moved or replaced the binary
+  const newBin = await findClaudeBin();
+  const after = newBin ? await claudeVersion(newBin) : null;
+  const output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
+  if (!r.ok) return { ok: false, before, after, output, error: r.stderr || r.stdout || 'Update failed' };
+  return { ok: true, before, after, updated: !!(after && before !== after), output };
+});
 
 // The conductor runs with permissions bypassed, matching every other Claude
 // session Manifold spawns (see TOOL_CMD). Allowlisting was tried and abandoned:

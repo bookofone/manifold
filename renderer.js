@@ -2537,6 +2537,44 @@ document.getElementById('nuke-btn').addEventListener('click', async () => {
   location.reload();
 });
 
+// ── Claude Code CLI version / update (About pane) ──
+const claudeUpdateBtn = document.getElementById('claude-update-btn');
+const claudeVersionEl = document.getElementById('claude-cli-version');
+const claudeDot = document.getElementById('claude-cli-dot');
+
+async function refreshClaudeVersion() {
+  claudeVersionEl.textContent = 'Checking…';
+  const r = await manifold.claudeVersion();
+  claudeVersionEl.textContent = r.ok ? `v${r.version}` : r.error;
+  claudeDot.className = `remote-row-dot ${r.ok ? 'ok' : 'fail'}`;
+  claudeUpdateBtn.disabled = !r.ok;
+  return r;
+}
+
+settingsNav.querySelector('[data-pane="about"]').addEventListener('click', () => {
+  if (!claudeUpdateBtn.dataset.busy) refreshClaudeVersion();
+});
+
+claudeUpdateBtn.addEventListener('click', async () => {
+  claudeUpdateBtn.dataset.busy = '1';
+  claudeUpdateBtn.disabled = true;
+  claudeUpdateBtn.textContent = 'Updating…';
+  const r = await manifold.claudeUpdate();
+  delete claudeUpdateBtn.dataset.busy;
+  await refreshClaudeVersion();
+  if (!r.ok) {
+    claudeUpdateBtn.textContent = 'Failed';
+    showToast(`Claude update failed: ${(r.error || '').split('\n').pop()}`, true);
+  } else if (r.updated) {
+    claudeUpdateBtn.textContent = `Updated to v${r.after}`;
+    claudeVersionEl.textContent = `v${r.after} · open sessions keep v${r.before} until reopened`;
+    showToast(`Claude Code updated to v${r.after}`);
+  } else {
+    claudeUpdateBtn.textContent = 'Up to date';
+  }
+  setTimeout(() => { if (!claudeUpdateBtn.dataset.busy) claudeUpdateBtn.textContent = 'Update'; }, 4000);
+});
+
 // ── Remote destinations management ──
 
 // Connection-test results, keyed by ssh cmd so they survive re-renders and the
