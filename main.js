@@ -1386,6 +1386,9 @@ function classifyConductorTurn(text) {
   const xs = t.match(/<cross-session-message\b[^>]*from-name="([^"]*)"[^>]*>([\s\S]*?)(?:<\/cross-session-message>|$)/);
   if (xs) return { role: 'agent', from: xs[1], text: xs[2].trim() };
 
+  // Messages the user sent to an agent through the conductor; the agent view
+  // shows them, the conductor feed need not replay the instruction.
+  if (/^\[Manifold relay\]/.test(t)) return { role: 'system', text: 'relay' };
   if (/^<task-notification\b/.test(t)) return { role: 'system', text: 'background task notification' };
   if (/^<[a-z-]+>/i.test(t) && /<\/[a-z-]+>/i.test(t)) return { role: 'system', text: t.slice(0, 120) };
 
@@ -1416,8 +1419,32 @@ ipcMain.handle('conductor-history', async (event, { sessionId, cwd, remote }) =>
     catch (_) { return { ok: false, entries: [] }; }
   }
 
+  const { entries } = transcriptEntries(raw.split('\n'));
+  // Long-running conductors accumulate; replaying everything would stall the
+  // pane on open, so keep the tail.
+  const MAX = 200;
+  return { ok: true, entries: entries.slice(-MAX), truncated: entries.length > MAX };
+});
+
+// Messages the user types to an agent from Manifold arrive in its transcript
+// as peer messages under this name; the parser turns them back into "you".
+const MANIFOLD_PEER = 'Manifold';
+const MANIFOLD_PREFIX = '[From the user, via Manifold]\n';
+
+// One transcript parser for the conductor replay and the agent chat view.
+// Also returns the question an agent is stuck on: an AskUserQuestion call with
+// no tool_result yet.
+function transcriptEntries(lines) {
   const entries = [];
-  for (const line of raw.split('\n')) {
+  const answered = new Set();
+  let ask = null;
+  const pushUser = (text) => {
+    const c = classifyConductorTurn(text);
+    if (!c || c.role === 'system') return;
+    if (c.role === 'agent' && c.from === MANIFOLD_PEER) entries.push({ role: 'user', text: c.text.replace(MANIFOLD_PREFIX, '') });
+    else entries.push(c);
+  };
+  for (const line of lines) {
     if (!line.trim()) continue;
     let m;
     try { m = JSON.parse(line); } catch (_) { continue; }
@@ -1430,22 +1457,26 @@ ipcMain.handle('conductor-history', async (event, { sessionId, cwd, remote }) =>
       if (typeof content === 'string') text = content;
       else if (Array.isArray(content)) {
         text = content.filter((b) => b.type === 'text' && b.text).map((b) => b.text).join('\n');
+        for (const b of content) if (b.type === 'tool_result') answered.add(b.tool_use_id);
       }
-      const c = classifyConductorTurn(text);
-      if (c && c.role !== 'system') entries.push(c);
+      pushUser(text);
+    } else if (m.type === 'attachment' && m.attachment && m.attachment.type === 'queued_command') {
+      // A message that arrived mid-turn is folded in at the next step as an
+      // attachment, never as a user line.
+      pushUser(m.attachment.prompt);
     } else if (m.type === 'assistant' && Array.isArray(content)) {
       for (const b of content) {
         if (b.type === 'text' && b.text && b.text.trim()) entries.push({ role: 'assistant', text: b.text });
-        else if (b.type === 'tool_use') entries.push({ role: 'tool', name: b.name, input: b.input });
+        else if (b.type === 'tool_use') {
+          entries.push({ role: 'tool', name: b.name, input: b.input });
+          if (b.name === 'AskUserQuestion') ask = b;
+        }
       }
     }
   }
-
-  // Long-running conductors accumulate; replaying everything would stall the
-  // pane on open, so keep the tail.
-  const MAX = 200;
-  return { ok: true, entries: entries.slice(-MAX), truncated: entries.length > MAX };
-});
+  const question = ask && !answered.has(ask.id) ? (ask.input && ask.input.questions) || [] : null;
+  return { entries, question };
+}
 
 function destroyAllConductors() {
   for (const [, c] of conductors) {
@@ -1590,6 +1621,31 @@ ipcMain.handle('agents-activity', async (event, { agents, remote }) => {
     out[a.id] = { events: events.slice(-3), mtime };
   }
   return out;
+});
+
+// The agent chat view: one agent's conversation, re-read every few seconds
+// while it is selected. Same parser as the conductor replay, plus the file's
+// mtime (for "active 12s ago") and any question the agent is blocked on.
+const AGENT_VIEW_TAIL_BYTES = 400 * 1024;
+ipcMain.handle('agent-transcript', async (event, { sessionId, cwd, remote }) => {
+  if (!sessionId || !cwd) return { ok: false, error: 'No transcript yet' };
+  let lines, mtime = 0;
+  if (remote) {
+    if (!SAFE_ID.test(sessionId)) return { ok: false, error: 'Bad session id' };
+    const f = `${remoteProjectDir(cwd)}/${sessionId}.jsonl`;
+    // First line is the mtime (GNU stat, then BSD), the rest is the tail.
+    const res = await runRemoteCmd(remote, `{ stat -c %Y ${f} 2>/dev/null || stat -f %m ${f} 2>/dev/null || echo 0; } ; tail -c ${AGENT_VIEW_TAIL_BYTES} ${f}`, { timeout: 20000 });
+    if (!res.ok) return { ok: false, error: (res.stderr || 'Could not read the remote transcript').trim().slice(0, 300) };
+    lines = String(res.stdout).split('\n');
+    mtime = (parseInt(lines.shift(), 10) || 0) * 1000;
+  } else {
+    const file = path.join(getProjectDir(cwd), sessionId + '.jsonl');
+    try { mtime = fs.statSync(file).mtimeMs; lines = tailJsonl(file, AGENT_VIEW_TAIL_BYTES); }
+    catch (_) { return { ok: false, error: 'No transcript yet — the agent is still starting' }; }
+  }
+  const { entries, question } = transcriptEntries(lines);
+  const MAX = 300;
+  return { ok: true, entries: entries.slice(-MAX), truncated: entries.length > MAX, question, mtime };
 });
 
 ipcMain.handle('agent-logs', async (event, { id, cwd, remote }) => {

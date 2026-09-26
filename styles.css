@@ -1914,3 +1914,47 @@ body {
     cursor: text;
   }
 }
+
+/* ── Agent chat view: the chat swapped to one background agent ── */
+.cond-agent { cursor: pointer; }
+.cond-agent:hover { border-color: #3a3a3a; }
+.cond-agent-selected, .cond-agent-selected:hover { border-color: #D97757; box-shadow: inset 3px 0 0 #D97757; }
+.cond-agent-home { padding: 6px 9px; }
+.cond-agent-home .cond-agent-top { margin-bottom: 0; }
+.cond-targeting .cond-input-row { box-shadow: inset 0 2px 0 #D97757; }
+
+.cond-target {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid #2c2c2c;
+  background: #1e1e1e;
+  font-size: 12px;
+}
+.cond-target-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cond-target-back {
+  background: none; border: 1px solid #333; color: #9a9a9a; border-radius: 3px;
+  font: inherit; font-size: 11px; padding: 2px 6px; cursor: pointer;
+}
+.cond-target-back:hover { color: #D97757; border-color: #D97757; }
+.cond-target-name { color: #D97757; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cond-target-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: #2c2c2c; color: #9a9a9a; flex-shrink: 0; }
+.cond-target-badge.st-working, .cond-target-badge.st-running { background: #3a2a22; color: #D97757; }
+.cond-target-badge.st-blocked { background: #3a3014; color: #e8b339; }
+.cond-target-badge.st-done { background: #1c2620; color: #4e9a68; }
+.cond-target-ago { margin-left: auto; color: #666; font-size: 11px; flex-shrink: 0; }
+.cond-target-tools { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 5px; color: #888; font-size: 11px; }
+.cond-target-question {
+  margin-top: 8px; padding: 8px 10px; border: 1px solid #b8860b; background: #241f14;
+  border-radius: 4px; color: #e8d4a0; white-space: pre-wrap;
+}
+.cond-q-text { font-size: 13px; }
+.cond-q-opts { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0 2px; }
+.cond-q-opt {
+  background: #2c2616; border: 1px solid #b8860b; color: #e8b339; border-radius: 3px;
+  font: inherit; font-size: 11px; padding: 2px 8px; cursor: pointer;
+}
+.cond-q-opt:hover { background: #3a3014; }
+.cond-msg-relay { opacity: 0.7; }
+.cond-msg-relay .cond-msg-from { color: #1a1a1a; }
+.cond-msg-relay-failed { opacity: 1; background: #3a2526; color: #e5484d; }
+.cond-msg-relay-failed .cond-msg-from { color: #e5484d; }

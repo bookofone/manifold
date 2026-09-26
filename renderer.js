@@ -353,7 +353,9 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
   el.className = 'conductor-pane';
   el.innerHTML = `
     <div class="cond-main">
+      <div class="cond-target hidden"></div>
       <div class="cond-log"></div>
+      <div class="cond-log cond-agent-view hidden"></div>
       <div class="cond-queue hidden"></div>
       <form class="cond-input-row">
         <textarea class="cond-input" rows="1" placeholder="Message the conductor — always open, never blocks" spellcheck="false"></textarea>
@@ -398,6 +400,13 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
     rosterInit: false,
     showDone: false,
     pendingNotices: [],
+    // Chat target: null is the conductor; otherwise a background agent id whose
+    // transcript is shown in `av` and to which the input box relays. The
+    // conductor's own log keeps receiving its stream while hidden.
+    target: null,
+    targetHead: el.querySelector('.cond-target'),
+    av: { log: el.querySelector('.cond-agent-view') },
+    relays: [],
   };
   conductorPanes.set(tabId, pane);
 
@@ -516,6 +525,7 @@ function submitConductorMessage(pane) {
   if (!text) return;
   pane.input.value = '';
   pane.input.style.height = 'auto';
+  if (pane.target) return relayToAgent(pane, text);
 
   condBubble(pane, 'user', text);
 
@@ -721,6 +731,7 @@ manifold.onConductorEvent((tabId, msg) => {
       break;
 
     case 'manifold_exit':
+      for (const r of pane.relays) if (!r.failed) relayFailed(pane, r, 'conductor exited before relaying');
       condSysLine(pane, `Conductor exited (code ${msg.code}).`, true);
       terminalAlive.set(tabId, false);
       pane.busy = false;
@@ -808,6 +819,13 @@ function renderRoster(pane, agents) {
   pane.rosterEmpty.classList.toggle('hidden', agents.length > 0);
   pane.rosterList.innerHTML = '';
 
+  // The conductor is pinned first: the default chat target, and the way back.
+  const home = document.createElement('div');
+  home.className = 'cond-agent cond-agent-home' + (pane.target ? '' : ' cond-agent-selected');
+  home.innerHTML = `<div class="cond-agent-top"><span class="cond-agent-dot ${pane.busy ? 'busy' : ''}"></span><span class="cond-agent-id">conductor</span><span class="cond-agent-status">${pane.busy ? 'working' : 'ready'}</span></div>`;
+  home.addEventListener('click', () => selectChatTarget(pane, null));
+  pane.rosterList.appendChild(home);
+
   for (const a of agents) {
     const card = document.createElement('div');
     card.className = 'cond-agent';
@@ -818,6 +836,9 @@ function renderRoster(pane, agents) {
     const isBlocked = status === 'blocked';
     const busy = !isBlocked && status !== 'idle' && status !== 'done';
     if (isBlocked) card.classList.add('cond-agent-blocked');
+    if (a.id === pane.target) card.classList.add('cond-agent-selected');
+    card.title = 'Click to chat with this agent';
+    card.addEventListener('click', (e) => { if (!e.target.closest('button')) selectChatTarget(pane, a.id); });
 
     card.innerHTML = `
       <div class="cond-agent-top">
@@ -854,6 +875,163 @@ function renderRoster(pane, agents) {
   }
 
   renderAgentActivity(pane, agents);
+  if (pane.target) renderTargetHead(pane);
+}
+
+// ── Agent chat view ──
+//
+// Clicking a card swaps the chat to that agent's own transcript and routes the
+// input box to it. There is no direct send, so messages are relayed: the
+// conductor is told to pass the text verbatim via SendMessage. The relayed
+// bubble stays "pending" until the text shows up in the agent's transcript.
+
+function targetAgent(pane) {
+  return (pane.agents || []).find((a) => a.id === pane.target) || null;
+}
+
+function selectChatTarget(pane, id) {
+  if (pane.target === id) return;
+  pane.target = id;
+  pane.avSig = null;
+  pane.avData = null;
+  pane.av.log.innerHTML = '';
+  pane.log.classList.toggle('hidden', !!id);
+  pane.av.log.classList.toggle('hidden', !id);
+  pane.targetHead.classList.toggle('hidden', !id);
+  pane.element.classList.toggle('cond-targeting', !!id);
+  const a = targetAgent(pane);
+  pane.input.placeholder = id
+    ? `Message ${(a && a.name) || id}\u2026 (relayed via conductor)`
+    : 'Message the conductor \u2014 always open, never blocks';
+  if (id) {
+    condSysLine(pane.av, 'Loading transcript\u2026');
+    renderTargetHead(pane);
+    refreshAgentView(pane);
+  } else {
+    condScroll(pane);
+  }
+  if (pane.agents) renderRoster(pane, pane.agents);
+  pane.input.focus();
+}
+
+function fmtAgo(ms) {
+  if (!ms) return '';
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+}
+
+function renderTargetHead(pane) {
+  const a = targetAgent(pane);
+  const d = pane.avData || {};
+  const st = a ? (a.state || a.status || 'unknown') : 'gone';
+  const tools = (d.entries || []).filter((e) => e.role === 'tool').slice(-3);
+  const q = d.question;
+  pane.targetHead.innerHTML = `
+    <div class="cond-target-top">
+      <button class="cond-target-back" title="Back to the conductor">\u2190 conductor</button>
+      <span class="cond-target-name">${escHtml((a && a.name) || pane.target)}</span>
+      <span class="cond-target-badge st-${escAttr(st)}">${escHtml(st === 'blocked' ? 'blocked \u00b7 needs you' : st)}</span>
+      <span class="cond-target-ago">${d.mtime ? 'active ' + fmtAgo(d.mtime) : ''}</span>
+    </div>
+    ${tools.length ? `<div class="cond-target-tools">${tools.map((t) => `<span><span class="cond-feed-tool">${escHtml(t.name)}</span> ${escHtml(shortTarget(String((t.input && (t.input.file_path || t.input.command || t.input.pattern || t.input.description)) || '')))}</span>`).join('')}</div>` : ''}
+    ${q ? `<div class="cond-target-question">${q.map((x) => `
+      <div class="cond-q-text">${escHtml(x.question || x.header || '')}</div>
+      <div class="cond-q-opts">${(x.options || []).map((o) => `<button class="cond-q-opt" data-label="${escAttr(o.label || '')}" title="${escAttr(o.description || '')}">${escHtml(o.label || '')}</button>`).join('')}</div>`).join('')}</div>`
+      : st === 'blocked' ? '<div class="cond-target-question"><div class="cond-q-text">Blocked, waiting for an answer. Reply below.</div></div>' : ''}
+  `;
+  pane.targetHead.querySelector('.cond-target-back').addEventListener('click', () => selectChatTarget(pane, null));
+  pane.targetHead.querySelectorAll('.cond-q-opt').forEach((b) => b.addEventListener('click', () => {
+    pane.input.value = b.dataset.label;
+    pane.input.focus();
+  }));
+}
+
+async function refreshAgentView(pane) {
+  const id = pane.target;
+  const a = targetAgent(pane);
+  if (!id || !a || pane.avBusy) return;
+  pane.avBusy = true;
+  pane.lastAgentViewAt = Date.now();
+  let res;
+  try { res = await manifold.agentTranscript(a.sessionId, a.cwd || pane.cwd, pane.remote); }
+  finally { pane.avBusy = false; }
+  if (pane.target !== id) return; // switched away while reading
+
+  if (!res || !res.ok) {
+    if (!pane.avData) { pane.av.log.innerHTML = ''; condSysLine(pane.av, (res && res.error) || 'Could not read transcript', true); }
+    return;
+  }
+  pane.avData = res;
+
+  // Relays reconcile once their text appears in the agent's own transcript.
+  const seen = res.entries.filter((e) => e.role !== 'tool').map((e) => e.text || '');
+  pane.relays = pane.relays.filter((r) => {
+    if (r.agentId !== id || !seen.some((t) => t.includes(r.text))) return true;
+    if (r.timer) clearTimeout(r.timer);
+    return false;
+  });
+
+  const last = res.entries[res.entries.length - 1];
+  const sig = `${res.entries.length}|${last ? (last.text || last.name || '').length : 0}|${pane.relays.length}`;
+  if (sig !== pane.avSig) {
+    pane.avSig = sig;
+    const log = pane.av.log;
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    const keep = log.scrollTop;
+    log.innerHTML = '';
+    if (res.truncated) condSysLine(pane.av, '\u2026earlier history trimmed');
+    for (const e of res.entries) {
+      if (e.role === 'tool') condToolChip(pane.av, e.name, e.input);
+      else if (e.role === 'agent') condAgentBubble(pane.av, e.from === pane.selfName ? 'you \u00b7 relayed via conductor' : e.from, e.text);
+      else condBubble(pane.av, e.role, e.text);
+    }
+    for (const r of pane.relays) if (r.agentId === id) relayBubble(pane, r);
+    if (!atBottom && pane.avSig !== null) log.scrollTop = keep; // don't yank a reader
+  }
+  renderTargetHead(pane);
+}
+
+function relayBubble(pane, r) {
+  r.el = condBubble(pane.av, 'user', r.text);
+  r.el.classList.add('cond-msg-relay');
+  const tag = document.createElement('div');
+  tag.className = 'cond-msg-from';
+  r.el.prepend(tag);
+  r.tag = tag;
+  relayTag(r);
+}
+
+function relayTag(r) {
+  if (!r.tag) return;
+  r.tag.textContent = r.failed ? `relay failed \u2014 ${r.failed}` : 'relayed via conductor \u00b7 pending';
+  r.el.classList.toggle('cond-msg-relay-failed', !!r.failed);
+}
+
+function relayFailed(pane, r, why) {
+  r.failed = why;
+  if (r.timer) clearTimeout(r.timer);
+  relayTag(r);
+  condSysLine(pane, `Relay to ${r.agentId} failed: ${why}`, true);
+}
+
+function relayToAgent(pane, text) {
+  const a = targetAgent(pane);
+  const r = { agentId: pane.target, text };
+  pane.relays.push(r);
+  relayBubble(pane, r);
+  if (!a) return relayFailed(pane, r, 'agent is no longer in the roster');
+  if (!pane.started || !terminalAlive.get(pane.tabId)) return relayFailed(pane, r, 'conductor is not running');
+
+  const name = a.name || a.id;
+  condSysLine(pane, `\u21aa relaying to ${a.id}: ${text.slice(0, 80)}`);
+  pane.queue.push(`[Manifold relay] The user typed a message to background agent ${a.id} in Manifold's agent view. ` +
+    `Use SendMessage to send the text between the markers below, verbatim and unedited, to the session named "${name}" ` +
+    `(background agent id ${a.id}; if that name does not resolve, find it with ListAgents). ` +
+    `Do nothing else: no other tools, no commentary. Reply only "relayed", or the error if it failed.\n<<<\n${text}\n>>>`);
+  renderQueue(pane);
+  preemptAndDrain(pane);
+  // If it never lands in the transcript, say so rather than pending forever.
+  r.timer = setTimeout(() => { if (pane.relays.includes(r) && !r.failed) relayFailed(pane, r, 'not seen in the agent transcript after 2 minutes \u2014 check the conductor'); }, 120000);
 }
 
 // What each agent is actually doing, tailed from its own transcript. `claude
@@ -1013,6 +1191,18 @@ setInterval(() => {
     drainConductorQueue(pane);
   }
 }, 5000);
+
+// Agent view: re-read the selected agent's transcript tail (slower over ssh),
+// and keep the "active Ns ago" clock ticking between reads.
+setInterval(() => {
+  const now = Date.now();
+  for (const [tabId, pane] of conductorPanes) {
+    if (!pane.target || !isTerminalVisible(tabId)) continue;
+    if (now - (pane.lastAgentViewAt || 0) >= (pane.remote ? 10000 : 3000)) refreshAgentView(pane);
+    const ago = pane.targetHead.querySelector('.cond-target-ago');
+    if (ago && pane.avData && pane.avData.mtime) ago.textContent = 'active ' + fmtAgo(pane.avData.mtime);
+  }
+}, 1000);
 
 // Roster poll — only for panes that are actually on screen. A remote pane pays
 // a fresh ssh connection for each listing, so it polls a good deal slower; the

@@ -39,6 +39,14 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   an agent transitions to `done`; "attach" spawns a normal pty tab running
   `claude attach <id>`, promoting a background agent to a full TUI. Under a remote conductor
   every one of these runs on the remote host, and attach opens an ssh tab.
+- **Agent chat view**: clicking a roster card (not its buttons) swaps the conductor pane's chat
+  to that agent: its transcript (`agent-transcript`, same `transcriptEntries` parser as the
+  conductor replay) re-read every 3s (10s remote), a header with state badge, time since
+  last write, recent tools, and any unanswered AskUserQuestion. The pinned "conductor" card
+  swaps back; the conductor's own log keeps streaming while hidden. There is no direct send:
+  input is *relayed* — a `[Manifold relay]` message tells the conductor to SendMessage the text
+  verbatim to the agent's session name. The bubble stays "pending" until the text appears in
+  the agent transcript, and fails visibly after 2 min or if the conductor exits.
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work

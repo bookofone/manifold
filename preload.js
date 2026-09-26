@@ -73,6 +73,7 @@ contextBridge.exposeInMainWorld('manifold', {
   // Background agents (claude --bg / agents / logs / stop)
   agentsList: (cwd, remote) => ipcRenderer.invoke('agents-list', { cwd, remote }),
   agentDispatch: (opts) => ipcRenderer.invoke('agent-dispatch', opts),
+  agentTranscript: (sessionId, cwd, remote) => ipcRenderer.invoke('agent-transcript', { sessionId, cwd, remote }),
   agentsActivity: (agents, remote) => ipcRenderer.invoke('agents-activity', { agents, remote }),
   agentLogs: (id, cwd, remote) => ipcRenderer.invoke('agent-logs', { id, cwd, remote }),
   agentStop: (id, cwd, remote) => ipcRenderer.invoke('agent-stop', { id, cwd, remote }),
