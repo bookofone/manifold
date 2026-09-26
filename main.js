@@ -155,7 +155,7 @@ function spawnSsh(remote, remoteCmd, opts = {}) {
 // The remote host's own ~/.claude/projects/<encoded cwd> — same encoding as
 // getProjectDir, but resolved against the remote $HOME at run time.
 function remoteProjectDir(remotePath) {
-  return '"$HOME/.claude/projects/' + remotePath.replace(/[^a-zA-Z0-9._-]/g, '-') + '"';
+  return '"$HOME/.claude/projects/' + remotePath.replace(/[^a-zA-Z0-9_-]/g, '-') + '"';
 }
 
 // Session ids get interpolated into remote command lines unquoted.
