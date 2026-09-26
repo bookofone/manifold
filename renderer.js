@@ -348,7 +348,7 @@ manifold.onTerminalData((id, data) => {
 
 const conductorPanes = new Map(); // tabId -> pane state
 
-function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null) {
+function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null, remote = null) {
   const el = document.createElement('div');
   el.className = 'conductor-pane';
   el.innerHTML = `
@@ -375,6 +375,9 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
   const pane = {
     tabId,
     cwd,
+    // An SSH command string when the collection is remote. Everything this pane
+    // touches — the process, the transcript, the roster — then lives over there.
+    remote: remote || null,
     element: el,
     log: el.querySelector('.cond-log'),
     queueEl: el.querySelector('.cond-queue'),
@@ -447,7 +450,7 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
 }
 
 async function replayConductorHistory(pane, sessionId) {
-  const res = await manifold.conductorHistory(sessionId, pane.cwd);
+  const res = await manifold.conductorHistory(sessionId, pane.cwd, pane.remote);
   if (!res || !res.ok || !res.entries.length) return;
   if (res.truncated) condSysLine(pane, '…earlier history trimmed');
   for (const e of res.entries) {
@@ -459,10 +462,11 @@ async function replayConductorHistory(pane, sessionId) {
 }
 
 async function startConductor(pane, name) {
-  condSysLine(pane, pane.sessionId ? 'Resuming conductor…' : `Starting conductor in ${pane.cwd}…`);
+  const where = pane.remote ? `${pane.cwd} on ${pane.remote}` : pane.cwd;
+  condSysLine(pane, pane.sessionId ? 'Resuming conductor…' : `Starting conductor in ${where}…`);
   const res = await manifold.conductorCreate({
     id: pane.tabId, cwd: pane.cwd, model: 'sonnet',
-    sessionId: pane.sessionId, name: pane.selfName,
+    sessionId: pane.sessionId, name: pane.selfName, remote: pane.remote,
   });
   if (!res || !res.ok) {
     condSysLine(pane, `Failed to start: ${(res && res.error) || 'unknown error'}`, true);
@@ -498,7 +502,7 @@ function conductorBirthMessage(pane) {
 
   const text = resumed
     ? CONDUCTOR_BIRTH_PROMPTS.resumed()
-    : CONDUCTOR_BIRTH_PROMPTS.fresh(pane.cwd);
+    : CONDUCTOR_BIRTH_PROMPTS.fresh(pane.remote ? `${pane.cwd} (on the remote host reached with \`${pane.remote}\`)` : pane.cwd);
 
   condSysLine(pane, resumed ? 'Catching up\u2026' : 'Orienting\u2026');
   pane.queue.push(text);
@@ -632,6 +636,26 @@ function condToolChip(pane, name, input) {
   condScroll(pane);
 }
 
+// A dropped SSH link kills the local end, not the conversation: the transcript
+// is on the remote and pane.sessionId still points at it. One click resumes,
+// rather than making the user restart Manifold to get the pane back.
+function condReconnect(pane) {
+  const div = document.createElement('div');
+  div.className = 'cond-sys cond-reconnect';
+  div.textContent = pane.sessionId ? '\u21bb reconnect and resume' : '\u21bb restart conductor';
+  div.addEventListener('click', () => {
+    div.remove();
+    // The pane already shows the conversation, so it should come back quietly
+    // rather than re-running its orientation turn.
+    pane.announced = false;
+    pane.birthSent = true;
+    terminalAlive.set(pane.tabId, true);
+    startConductor(pane);
+  });
+  pane.log.appendChild(div);
+  condScroll(pane);
+}
+
 manifold.onConductorEvent((tabId, msg) => {
   const pane = conductorPanes.get(tabId);
   if (!pane) return;
@@ -702,6 +726,7 @@ manifold.onConductorEvent((tabId, msg) => {
       pane.busy = false;
       setConductorBusy(pane, false);
       renderQueue(pane);
+      condReconnect(pane);
       break;
   }
 });
@@ -709,7 +734,15 @@ manifold.onConductorEvent((tabId, msg) => {
 // ── Roster: the subconscious ──
 
 async function refreshRoster(pane) {
-  const res = await manifold.agentsList(pane.cwd);
+  // A remote listing is an ssh round trip, which on a slow link can outlast the
+  // poll interval. Without this the calls stack up and the roster flickers
+  // between stale answers arriving out of order.
+  if (pane.rosterBusy) return;
+  pane.rosterBusy = true;
+  let res;
+  try { res = await manifold.agentsList(pane.cwd, pane.remote); }
+  finally { pane.rosterBusy = false; }
+
   if (!res || !res.ok) {
     pane.rosterEmpty.textContent = (res && res.error) || 'Could not list agents.';
     pane.rosterEmpty.classList.remove('hidden');
@@ -806,13 +839,13 @@ function renderRoster(pane, agents) {
     // watching to driving, which is the one thing the terminal does better.
     card.querySelector('.act-attach').addEventListener('click', () => attachAgentTab(pane, a));
     card.querySelector('.act-logs').addEventListener('click', async () => {
-      const r = await manifold.agentLogs(a.id, pane.cwd);
+      const r = await manifold.agentLogs(a.id, pane.cwd, pane.remote);
       condSysLine(pane, `── logs ${a.id} ──`);
       condBubble(pane, 'logs', (r && r.text) || '(no output)');
     });
     card.querySelector('.act-del').addEventListener('click', () => removeAgent(pane, a, busy));
     card.querySelector('.act-stop').addEventListener('click', async () => {
-      const r = await manifold.agentStop(a.id, pane.cwd);
+      const r = await manifold.agentStop(a.id, pane.cwd, pane.remote);
       condSysLine(pane, r && r.ok ? `Stopped ${a.id}.` : `Stop failed: ${(r && r.error) || '?'}`, !(r && r.ok));
       refreshRoster(pane);
     });
@@ -832,7 +865,7 @@ async function renderAgentActivity(pane, agents) {
     .map((a) => ({ id: a.id, sessionId: a.sessionId, cwd: a.cwd || pane.cwd }));
   if (!live.length) return;
 
-  const res = await manifold.agentsActivity(live);
+  const res = await manifold.agentsActivity(live, pane.remote);
   if (!res) return;
 
   for (const [id, info] of Object.entries(res)) {
@@ -881,7 +914,7 @@ async function removeAgent(pane, agent, isBusy) {
     const ok = await showConfirmDialog(`Stop and delete "${agent.name || agent.id}"? It is still working.`, 'Stop & delete');
     if (!ok) return;
   }
-  const res = await manifold.agentRemove({ id: agent.id, cwd: agent.cwd || pane.cwd });
+  const res = await manifold.agentRemove({ id: agent.id, cwd: agent.cwd || pane.cwd, remote: pane.remote });
   if (!res || !res.ok) {
     condSysLine(pane, `Could not delete ${agent.id}: ${(res && res.error) || '?'}`, true);
   } else {
@@ -898,7 +931,7 @@ async function clearFinishedAgents(pane) {
   const done = (pane.agents || []).filter((a) => (a.state || a.status) === 'done');
   if (!done.length) return;
   for (const a of done) {
-    const res = await manifold.agentRemove({ id: a.id, cwd: a.cwd || pane.cwd });
+    const res = await manifold.agentRemove({ id: a.id, cwd: a.cwd || pane.cwd, remote: pane.remote });
     if (!res || !res.ok) condSysLine(pane, `Could not delete ${a.id}: ${(res && res.error) || '?'}`, true);
     pane.agentStates.delete(a.id);
   }
@@ -942,8 +975,10 @@ function attachAgentTab(pane, agent) {
   const name = `▸ ${agent.id}`;
   const dir = agent.cwd || pane.cwd;
 
-  col.tabs.push({ id: tabId, name, cwd: dir, cmd });
-  createTerminalInstance(tabId, dir, null, name, col.name, null, false, cmd);
+  // A remote conductor's agents live on the far host, so the attach tab has to
+  // be an ssh tab — buildRemoteCmd already runs a custom command after cd'ing.
+  col.tabs.push({ id: tabId, name, cwd: dir, cmd, remote: pane.remote });
+  createTerminalInstance(tabId, dir, null, name, col.name, null, false, cmd, 'claude', null, false, pane.remote);
 
   col.expanded = true;
   selectTab(ci, col.tabs.length - 1);
@@ -956,7 +991,7 @@ async function dispatchAgentPrompt(pane) {
   const prompt = await showInputDialog('Dispatch background agent', 'Self-contained task for the agent...');
   if (!prompt) return;
   condSysLine(pane, `Dispatching: ${prompt.slice(0, 80)}…`);
-  const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: 'sonnet' });
+  const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: 'sonnet', remote: pane.remote });
   if (!res || !res.ok) {
     condSysLine(pane, `Dispatch failed: ${(res && res.error) || '?'}`, true);
     return;
@@ -979,10 +1014,18 @@ setInterval(() => {
   }
 }, 5000);
 
-// Roster poll — only for panes that are actually on screen.
+// Roster poll — only for panes that are actually on screen. A remote pane pays
+// a fresh ssh connection for each listing, so it polls a good deal slower; the
+// turn-finished refresh in the event handler keeps it current when it matters.
+const ROSTER_POLL_MS = 4000;
+const REMOTE_ROSTER_POLL_MS = 15000;
 setInterval(() => {
+  const now = Date.now();
   for (const [tabId, pane] of conductorPanes) {
-    if (isTerminalVisible(tabId)) refreshRoster(pane);
+    if (!isTerminalVisible(tabId)) continue;
+    if (now - (pane.lastRosterAt || 0) < (pane.remote ? REMOTE_ROSTER_POLL_MS : ROSTER_POLL_MS)) continue;
+    pane.lastRosterAt = now;
+    refreshRoster(pane);
   }
 }, 4000);
 
@@ -997,10 +1040,6 @@ function destroyConductorPane(tabId) {
 function addConductor(ci, cwd = null) {
   const col = state.collections[ci];
   if (!col) return;
-  if (col.remote) {
-    showToast('Conductor runs locally — not available on remote collections', true);
-    return;
-  }
 
   const wasGridded = col.gridded;
   if (wasGridded) hideGridView();
@@ -1009,8 +1048,8 @@ function addConductor(ci, cwd = null) {
   const dir = cwd || col.path;
   const name = `Conductor ${col.tabs.length + 1}`;
 
-  col.tabs.push({ id: tabId, name, cwd: dir, provider: 'conductor' });
-  createConductorPane(tabId, dir, name);
+  col.tabs.push({ id: tabId, name, cwd: dir, provider: 'conductor', remote: col.remote || null });
+  createConductorPane(tabId, dir, name, null, null, col.remote || null);
 
   col.expanded = true;
   selectTab(ci, col.tabs.length - 1);
@@ -1423,15 +1462,7 @@ function addDefaultSession(ci, cwd = null) {
   switch (state.defaultSource) {
     case 'copilot': return addCopilot(ci, cwd);
     case 'terminal': return addTerminal(ci, cwd);
-    case 'conductor': {
-      // Conductor is local-only. On a remote collection fall back to a normal
-      // session so Ctrl+T still produces something instead of a dead toast.
-      if (state.collections[ci] && state.collections[ci].remote) {
-        showToast('Conductor is local-only — opened a Claude session instead');
-        return addSession(ci, cwd);
-      }
-      return addConductor(ci, cwd);
-    }
+    case 'conductor': return addConductor(ci, cwd);
     default: return addSession(ci, cwd);
   }
 }
@@ -3177,7 +3208,7 @@ async function restoreFromState(data) {
         remote: tabRemote,
       });
       if (provider === 'conductor') {
-        createConductorPane(tabId, cwd, tabData.name || 'Conductor', tabData.conductorSessionId || null, tabData.conductorName || null);
+        createConductorPane(tabId, cwd, tabData.name || 'Conductor', tabData.conductorSessionId || null, tabData.conductorName || null, tabRemote);
       } else {
         createTerminalInstance(tabId, cwd, isNonClaude ? null : (tabData.conversationId || null), tabData.name || 'Session', col.name, null, tabData.shell || false, tabData.cmd || null, provider, copilotSessionId, provider === 'copilot' && !!copilotSessionId, tabRemote);
       }

@@ -25,12 +25,20 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   never blocks on a turn — messages queue in the renderer and drain as the process frees up.
   It registers a shim in `terminalInstances` (`isConductor: true`) so the existing show/hide/
   grid/close paths work unchanged.
+- **Remote conductor**: on a collection with `col.remote`, the same argv runs over ssh
+  (`bash -lc '… exec claude …'`, every arg `shQuote`d) instead of being spawned locally, so
+  the multi-line `--append-system-prompt` survives. `RequestTTY=no` keeps the JSONL clean;
+  `ServerAliveInterval` turns a dropped link into exit 255, which the pane reports as a
+  death with a one-click "reconnect and resume". Resume probes, transcript replay and the
+  whole roster read the *remote* `~/.claude/projects/<encoded-path>`, never the local one.
 - **Background agents**: `claude --bg --dangerously-skip-permissions "<task>"` dispatches
   (prompt is positional — `-p` is rejected), `claude agents --json` lists,
   `attach`/`logs`/`stop` manage. The roster filters to `kind === 'background'`: interactive
   sessions are listed too but carry no short `id`. It polls every 4s for visible conductor
-  panes and raises a notice when an agent transitions to `done`; "attach" spawns a normal
-  pty tab running `claude attach <id>`, promoting a background agent to a full TUI.
+  panes (15s for remote ones — each poll is a fresh ssh connection) and raises a notice when
+  an agent transitions to `done`; "attach" spawns a normal pty tab running
+  `claude attach <id>`, promoting a background agent to a full TUI. Under a remote conductor
+  every one of these runs on the remote host, and attach opens an ssh tab.
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work

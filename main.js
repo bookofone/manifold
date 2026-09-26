@@ -108,6 +108,65 @@ function sendTerminalMsg(id, msg) {
   }
 }
 
+// Single-quote a value for a POSIX remote shell. Multi-line text (the
+// conductor's system prompt) passes through untouched — only the quote itself
+// needs escaping — so nothing on the remote side has to decode anything.
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// Parse the user's SSH command the same way ssh-ls does, then run `remoteCmd`
+// over a plain pipe: RequestTTY=no keeps JSONL clean, and ServerAliveInterval
+// turns a dropped link into an exit instead of a pane that hangs forever.
+function sshArgv(remote, remoteCmd) {
+  const parts = remote.trim().split(/\s+/);
+  return {
+    bin: parts[0],
+    args: [
+      '-o', 'RequestTTY=no', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+      '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+      ...parts.slice(1),
+      remoteCmd,
+    ],
+  };
+}
+
+// A non-interactive ssh gets whatever PATH the remote login shell sets, which
+// often misses ~/.local/bin — the same problem CLAUDE_PATHS solves locally.
+const REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";';
+
+// bash -lc so the remote gets a login environment. Every argument is quoted
+// individually, which is what lets --append-system-prompt stay multi-line.
+function remoteClaudeCmd(remotePath, args) {
+  const inner = `${REMOTE_PATH} cd ${shQuote(remotePath)} && exec claude ${args.map(shQuote).join(' ')}`;
+  return `bash -lc ${shQuote(inner)}`;
+}
+
+function remoteShCmd(script) {
+  return `bash -lc ${shQuote(REMOTE_PATH + ' ' + script)}`;
+}
+
+function spawnSsh(remote, remoteCmd, opts = {}) {
+  const { spawn } = require('child_process');
+  const { bin, args } = sshArgv(remote, remoteCmd);
+  return IS_WIN ? spawn('wsl.exe', [bin, ...args], opts) : spawn(bin, args, opts);
+}
+
+// The remote host's own ~/.claude/projects/<encoded cwd> — same encoding as
+// getProjectDir, but resolved against the remote $HOME at run time.
+function remoteProjectDir(remotePath) {
+  return '"$HOME/.claude/projects/' + remotePath.replace(/[^a-zA-Z0-9._-]/g, '-') + '"';
+}
+
+// Session ids get interpolated into remote command lines unquoted.
+const SAFE_ID = /^[A-Za-z0-9._-]+$/;
+
+// runCmd, but the command runs on the remote host.
+function runRemoteCmd(remote, script, opts = {}) {
+  const { bin, args } = sshArgv(remote, remoteShCmd(script));
+  return runCmd(bin, args, opts);
+}
+
 function buildRemoteCmd(sshParams) {
   const { remotePath, shellOnly, customCmd, conversationId } = sshParams;
   if (shellOnly) return `cd "${remotePath}"`;
@@ -1067,10 +1126,18 @@ ipcMain.handle('claude-update', async () => {
 // The conductor also gets an addressable session name so dispatched agents can
 // message it back when they finish, instead of the work completing silently and
 // only surfacing when the user thinks to ask.
-function conductorPrompt(selfName) {
+function conductorPrompt(selfName, remote) {
   return [
     'You are the conductor of a Manifold workspace.',
     '',
+    // Without this it reasons about the machine Manifold is running on, and
+    // hands the user paths and agent ids that only exist on the other end.
+    ...(remote ? [
+      'You are running on a remote host, reached over SSH (' + remote + ').',
+      'Every path, file and command you see is on that host, not on the machine',
+      'showing you this window. Agents you dispatch run there too.',
+      '',
+    ] : []),
     'Your session is named "' + selfName + '". Background agents can reach you at',
     'that name with the SendMessage tool.',
     '',
@@ -1109,15 +1176,20 @@ function conductorPrompt(selfName) {
   ].join('\n');
 }
 
-ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, name }) => {
-  const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found. Install it to use a conductor.' };
+ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, name, remote }) => {
+  // A remote conductor runs the remote host's own `claude`, so the local probe
+  // says nothing about whether it will work.
+  let bin = null;
+  if (!remote) {
+    bin = await findClaudeBin();
+    if (!bin) return { ok: false, error: 'Claude Code CLI not found. Install it to use a conductor.' };
+  }
 
   // Unique per conductor so two of them never answer to the same address, but
   // stable across restarts: the renderer persists this and hands it back, so an
   // agent dispatched before a restart can still reach the conductor afterwards.
   const selfName = name || `manifold-conductor-${String(id).replace(/[^a-zA-Z0-9-]/g, '')}-${crypto.randomUUID().slice(0, 4)}`;
-  const dir = cwd || os.homedir();
+  const dir = cwd || (remote ? '.' : os.homedir());
 
   const send = (msg) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1129,11 +1201,19 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
   // before its first message leaves a session id that resolves to nothing.
   // `--resume` on a missing id is fatal (exit 1, "No conversation found"), so
   // check the file rather than letting a stale id kill the pane.
+  // On a remote the transcript lives on the far side, so the probe has to go
+  // over ssh — checking the local disk would reject every valid session id.
   let resumeId = null;
   if (sessionId) {
-    const f = path.join(getProjectDir(dir), sessionId + '.jsonl');
-    if (fs.existsSync(f)) resumeId = sessionId;
-    else send({ type: 'manifold_notice', text: 'Previous conversation not found on disk — starting fresh.' });
+    let found;
+    if (remote) {
+      found = SAFE_ID.test(sessionId) &&
+        (await runRemoteCmd(remote, `test -f ${remoteProjectDir(dir)}/${sessionId}.jsonl`, { timeout: 15000 })).ok;
+    } else {
+      found = fs.existsSync(path.join(getProjectDir(dir), sessionId + '.jsonl'));
+    }
+    if (found) resumeId = sessionId;
+    else send({ type: 'manifold_notice', text: `Previous conversation not found${remote ? ' on the remote host' : ' on disk'} — starting fresh.` });
   }
 
   const { spawn } = require('child_process');
@@ -1147,13 +1227,17 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
       '--model', model || 'sonnet',
       '--name', selfName,
       '--dangerously-skip-permissions',
-      '--append-system-prompt', conductorPrompt(selfName),
+      '--append-system-prompt', conductorPrompt(selfName, remote || null),
     ];
     // Resuming reuses the same session id and carries the conversation, so a
     // restarted conductor still remembers what was said.
     if (withResume) args.push('--resume', withResume);
 
-    const proc = spawn(bin, args, { cwd: dir, env: claudeEnv() });
+    // Remote: one ssh carrying the same argv, quoted for the far shell. stdin
+    // and stdout are ordinary pipes either way, so everything below is shared.
+    const proc = remote
+      ? spawnSsh(remote, remoteClaudeCmd(dir, args), { env: process.env })
+      : spawn(bin, args, { cwd: dir, env: claudeEnv() });
     let sawInit = false;
     let stderrTail = '';
 
@@ -1198,6 +1282,15 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
     });
 
     proc.on('exit', (code) => {
+      // 255 is ssh's own failure code — the link dropped, or never came up.
+      // Relaunching would hit the same wall, so say so and let the pane show it
+      // as dead. Reopening the tab resumes the conversation from its session id.
+      if (remote && code === 255) {
+        send({ type: 'manifold_error', text: stderrTail.trim() || 'SSH connection lost.' });
+        conductors.delete(id);
+        send({ type: 'manifold_exit', code });
+        return;
+      }
       // Died before it ever came up while resuming: the session is unusable, so
       // fall back to a fresh one instead of leaving the pane dead.
       if (withResume && !sawInit) {
@@ -1219,11 +1312,17 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
       send({ type: 'manifold_error', text: err.message });
     });
 
+    // A half-closed pipe (ssh dropped mid-turn) raises EPIPE on the stream, not
+    // at the write call — unhandled, that would take down the main process.
+    proc.stdin.on('error', (err) => {
+      send({ type: 'manifold_error', text: `Lost the conductor's input stream: ${err.message}` });
+    });
+
     return proc;
   };
 
   const proc = launch(resumeId);
-  conductors.set(id, { proc, cwd: dir, selfName, sessionId: resumeId });
+  conductors.set(id, { proc, cwd: dir, selfName, sessionId: resumeId, remote: remote || null });
   return { ok: true, selfName, resumed: !!resumeId };
 });
 
@@ -1297,15 +1396,25 @@ function classifyConductorTurn(text) {
   return { role: 'user', text: stripped };
 }
 
-// Rebuild a restored pane's feed from the session transcript on disk. The
+// Rebuild a restored pane's feed from the session transcript — on local disk,
+// or read back over ssh when the conductor lives on a remote host. The
 // conversation is already persisted by Claude Code, so there is no reason to
 // duplicate it into Manifold's state file.
-ipcMain.handle('conductor-history', (event, { sessionId, cwd }) => {
+ipcMain.handle('conductor-history', async (event, { sessionId, cwd, remote }) => {
   if (!sessionId || !cwd) return { ok: false, entries: [] };
-  const file = path.join(getProjectDir(cwd), sessionId + '.jsonl');
   let raw;
-  try { raw = fs.readFileSync(file, 'utf-8'); }
-  catch (_) { return { ok: false, entries: [] }; }
+  if (remote) {
+    if (!SAFE_ID.test(sessionId)) return { ok: false, entries: [] };
+    // tail, not cat: these run to hundreds of KB and only the last MAX entries
+    // are replayed anyway. A clipped first line fails JSON.parse and is skipped
+    // below, which is exactly the behaviour we want.
+    const res = await runRemoteCmd(remote, `tail -c 2000000 ${remoteProjectDir(cwd)}/${sessionId}.jsonl`, { timeout: 20000 });
+    if (!res.ok) return { ok: false, entries: [] };
+    raw = res.stdout;
+  } else {
+    try { raw = fs.readFileSync(path.join(getProjectDir(cwd), sessionId + '.jsonl'), 'utf-8'); }
+    catch (_) { return { ok: false, entries: [] }; }
+  }
 
   const entries = [];
   for (const line of raw.split('\n')) {
@@ -1348,15 +1457,27 @@ function destroyAllConductors() {
 
 // ── Background agent roster ──
 
-ipcMain.handle('agents-list', async (event, { cwd }) => {
+// A remote conductor dispatches its agents on the remote host, so the roster
+// has to be read there too — same argv, run through ssh instead of spawned
+// locally. Every handler below goes through here so there is one place that
+// knows the difference.
+async function runClaude(remote, cwd, args, timeout) {
+  if (remote) {
+    // runCmd does the WSL wrap itself, so hand it the ssh argv unwrapped.
+    const { bin, args: sshArgs } = sshArgv(remote, remoteClaudeCmd(cwd || '.', args));
+    return runCmd(bin, sshArgs, { timeout });
+  }
   const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
+  if (!bin) return { ok: false, stdout: '', stderr: 'Claude Code CLI not found' };
+  return runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout });
+}
 
+ipcMain.handle('agents-list', async (event, { cwd, remote }) => {
   // --cwd scopes the listing to sessions started under this collection's path.
   const args = ['agents', '--json'];
   if (cwd) args.push('--cwd', cwd);
 
-  const res = await runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+  const res = await runClaude(remote, cwd, args, 10000);
   if (!res.ok) return { ok: false, error: res.stderr || 'agents --json failed' };
   try {
     return { ok: true, agents: JSON.parse(res.stdout || '[]') };
@@ -1365,17 +1486,14 @@ ipcMain.handle('agents-list', async (event, { cwd }) => {
   }
 });
 
-ipcMain.handle('agent-dispatch', async (event, { cwd, prompt, model }) => {
-  const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
-
+ipcMain.handle('agent-dispatch', async (event, { cwd, prompt, model, remote }) => {
   // --bg takes the prompt as the positional argument; pairing it with -p is
   // rejected ("the job would be unattachable"), which is the whole point here —
   // a dispatched agent has to stay attachable.
   const args = ['--bg', '--dangerously-skip-permissions', prompt];
   if (model) args.push('--model', model);
 
-  const res = await runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 30000 });
+  const res = await runClaude(remote, cwd, args, 30000);
   if (!res.ok) return { ok: false, error: res.stderr || 'dispatch failed' };
 
   // --bg prints a banner then a hint block:
@@ -1411,40 +1529,71 @@ function tailJsonl(file, bytes) {
 
 const ACTIVITY_TAIL_BYTES = 48 * 1024;
 
-ipcMain.handle('agents-activity', (event, { agents }) => {
+function activityEvents(lines) {
+  const events = [];
+  for (const line of lines) {
+    let m;
+    try { m = JSON.parse(line); } catch (_) { continue; }
+    const c = (m.message || {}).content;
+    if (m.type !== 'assistant' || !Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b.type === 'tool_use') {
+        const i = b.input || {};
+        const target = i.file_path || i.command || i.pattern || i.description || '';
+        events.push({ kind: 'tool', name: b.name, target: String(target).slice(0, 120) });
+      } else if (b.type === 'text' && b.text && b.text.trim()) {
+        events.push({ kind: 'text', text: b.text.trim().replace(/\s+/g, ' ').slice(0, 160) });
+      }
+    }
+  }
+  return events;
+}
+
+// Remote transcripts, in one ssh round-trip for the whole roster — a connection
+// per agent every 4s would be a storm. Each tail is fenced by a marker line;
+// no JSONL line starts with '@', so the split is unambiguous.
+async function remoteActivity(remote, agents) {
   const out = {};
-  for (const a of agents || []) {
-    if (!a || !a.sessionId || !a.cwd) continue;
+  const safe = agents.filter((a) => SAFE_ID.test(a.sessionId));
+  if (!safe.length) return out;
+  const script = safe.map((a) => (
+    `printf '@@MF %s\\n' ${shQuote(a.id)}; tail -c ${ACTIVITY_TAIL_BYTES} ${remoteProjectDir(a.cwd)}/${a.sessionId}.jsonl 2>/dev/null; echo`
+  )).join('; ');
+
+  const res = await runRemoteCmd(remote, script, { timeout: 15000 });
+  if (!res.ok) return out;
+
+  for (const chunk of String(res.stdout).split(/^@@MF /m)) {
+    const nl = chunk.indexOf('\n');
+    if (nl === -1) continue;
+    const id = chunk.slice(0, nl).trim();
+    if (!id) continue;
+    const events = activityEvents(chunk.slice(nl + 1).split('\n').filter((l) => l.trim()));
+    out[id] = { events: events.slice(-3), mtime: 0 };
+  }
+  return out;
+}
+
+ipcMain.handle('agents-activity', async (event, { agents, remote }) => {
+  const list = (agents || []).filter((a) => a && a.sessionId && a.cwd);
+  if (remote) return remoteActivity(remote, list);
+
+  const out = {};
+  for (const a of list) {
     const file = path.join(getProjectDir(a.cwd), a.sessionId + '.jsonl');
     let events = [];
     let mtime = 0;
     try {
       mtime = fs.statSync(file).mtimeMs;
-      for (const line of tailJsonl(file, ACTIVITY_TAIL_BYTES)) {
-        let m;
-        try { m = JSON.parse(line); } catch (_) { continue; }
-        const c = (m.message || {}).content;
-        if (m.type !== 'assistant' || !Array.isArray(c)) continue;
-        for (const b of c) {
-          if (b.type === 'tool_use') {
-            const i = b.input || {};
-            const target = i.file_path || i.command || i.pattern || i.description || '';
-            events.push({ kind: 'tool', name: b.name, target: String(target).slice(0, 120) });
-          } else if (b.type === 'text' && b.text && b.text.trim()) {
-            events.push({ kind: 'text', text: b.text.trim().replace(/\s+/g, ' ').slice(0, 160) });
-          }
-        }
-      }
+      events = activityEvents(tailJsonl(file, ACTIVITY_TAIL_BYTES));
     } catch (_) { /* transcript not written yet — agent is still starting */ }
     out[a.id] = { events: events.slice(-3), mtime };
   }
   return out;
 });
 
-ipcMain.handle('agent-logs', async (event, { id, cwd }) => {
-  const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
-  const res = await runCmd(bin, ['logs', id], { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+ipcMain.handle('agent-logs', async (event, { id, cwd, remote }) => {
+  const res = await runClaude(remote, cwd, ['logs', id], 10000);
   return { ok: res.ok, text: res.stdout || res.stderr };
 });
 
@@ -1454,20 +1603,14 @@ ipcMain.handle('agent-logs', async (event, { id, cwd }) => {
 // Its stdout can carry worktree follow-ups (--discard-unpushed /
 // --force-remove-worktree tokens) when it can't finish the job, so the output
 // is handed back rather than swallowed.
-ipcMain.handle('agent-remove', async (event, { id, cwd }) => {
-  const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
-  const opts = { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 15000 };
-
-  const res = await runCmd(bin, ['rm', id], opts);
+ipcMain.handle('agent-remove', async (event, { id, cwd, remote }) => {
+  const res = await runClaude(remote, cwd, ['rm', id], 15000);
   const output = (res.stdout || res.stderr || '').trim();
   return { ok: res.ok, output, error: res.ok ? null : (output || 'rm failed') };
 });
 
-ipcMain.handle('agent-stop', async (event, { id, cwd }) => {
-  const bin = await findClaudeBin();
-  if (!bin) return { ok: false, error: 'Claude Code CLI not found' };
-  const res = await runCmd(bin, ['stop', id], { cwd: cwd || os.homedir(), env: claudeEnv(), timeout: 10000 });
+ipcMain.handle('agent-stop', async (event, { id, cwd, remote }) => {
+  const res = await runClaude(remote, cwd, ['stop', id], 10000);
   return { ok: res.ok, error: res.ok ? null : (res.stderr || 'stop failed') };
 });
 

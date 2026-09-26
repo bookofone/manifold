@@ -1570,6 +1570,13 @@ body {
 }
 .cond-sys-error { color: #cc6666; }
 
+.cond-reconnect {
+  color: #D97757;
+  cursor: pointer;
+  border-bottom: 1px dotted #D97757;
+}
+.cond-reconnect:hover { color: #e89477; }
+
 .cond-tool {
   align-self: flex-start;
   font-size: 11px;
