@@ -601,10 +601,34 @@ body {
   padding-bottom: 10px;
   border-bottom: 1px solid #242424;
 }
-/* A second heading within a pane — needs top space the pane's first one doesn't. */
-.settings-section-title-sub {
-  margin-top: 32px;
+/* Each titled block in a pane; spacing lives between groups, not on titles. */
+.settings-group + .settings-group { margin-top: 36px; }
+/* One setting: label + description stacked, control below. */
+.settings-row + .settings-row { margin-top: 24px; }
+.settings-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  margin-bottom: 12px;
 }
+.settings-row-text .settings-label {
+  color: #d0d0d0;
+  font-size: 13px;
+}
+.settings-desc {
+  color: #666;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.settings-row-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.settings-pane-intro { margin: -4px 0 16px; }
+.settings-note { margin-top: 8px; padding: 0 2px; }
 .settings-row-btn {
   display: flex;
   align-items: center;
@@ -656,43 +680,31 @@ body {
 }
 .settings-row-btn-nuke:hover .settings-row-arrow { color: #e74c3c; }
 /* ── Settings segmented control ── */
-.settings-row-segmented {
-  padding: 0;
-}
-.settings-segmented-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-.settings-segmented-top .settings-label {
-  color: #d0d0d0;
-  font-size: 13px;
-}
-.settings-segmented-top .settings-desc {
-  color: #666;
-  font-size: 11px;
-}
 .settings-kbd {
   color: #888;
   background: #141414;
   border: 1px solid #333;
   border-radius: 4px;
   padding: 1px 4px;
+  white-space: nowrap;
 }
+/* Wraps rather than squeezing labels when the modal is narrow. */
 .settings-segmented {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 .seg-btn {
-  flex: 1;
-  padding: 11px 10px;
+  flex: 1 1 0;
+  min-width: 84px;
+  padding: 9px 10px;
   background: #141414;
   border: 1px solid #222;
-  border-radius: 8px;
+  border-radius: 6px;
   color: #999;
   font-family: inherit;
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
@@ -707,40 +719,32 @@ body {
   background: #1e1614;
 }
 /* ── Settings slider ── */
-.settings-row-slider {
-  padding: 16px 18px;
-  margin-bottom: 6px;
-  background: #141414;
-  border: 1px solid #222;
-  border-radius: 8px;
-}
-.settings-slider-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-.settings-row-slider .settings-label {
-  color: #d0d0d0;
-  font-size: 13px;
-}
 .settings-scale-value {
   color: #D97757;
   font-size: 13px;
   font-weight: bold;
   min-width: 40px;
   text-align: right;
+  flex-shrink: 0;
 }
+/* Ticks sit under their values: 100% is a third of the way along 50–200,
+   measured between the centres of the 14px thumb at either end. */
 .settings-slider-ticks {
-  display: flex;
-  justify-content: space-between;
+  position: relative;
+  height: 12px;
   margin-top: 8px;
   color: #555;
   font-size: 10px;
 }
+.settings-slider-ticks span { position: absolute; top: 0; }
+.settings-slider-ticks span:nth-child(1) { left: 0; }
+.settings-slider-ticks span:nth-child(2) { left: calc(7px + (100% - 14px) / 3); transform: translateX(-50%); }
+.settings-slider-ticks span:nth-child(3) { right: 0; }
 #scale-slider {
   -webkit-appearance: none;
+  display: block;
   width: 100%;
+  margin: 0;
   height: 4px;
   background: #2a2a2a;
   border-radius: 2px;
@@ -1010,7 +1014,16 @@ body {
   background: transparent;
   border-color: transparent;
 }
+/* The one action on this row is always shown, and framed so it reads as a button. */
 .claude-cli-row .remote-row-btns { opacity: 1; }
+.claude-cli-row .remote-row-btn {
+  border-color: #333;
+  color: #d0d0d0;
+  padding: 6px 14px;
+  white-space: nowrap;
+}
+.claude-cli-row .remote-row-btn:hover { border-color: #D97757; }
+.claude-cli-row .remote-row-btn:disabled { border-color: #262626; }
 .remote-row-btn-del:hover {
   color: #e74c3c;
   border-color: #e74c3c44;
@@ -1258,6 +1271,30 @@ body {
 .remote-form-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Settings in a narrow window: nav goes across the top, lists go single-column ── */
+@media (max-width: 720px) {
+  #settings-modal { width: 96%; height: 94%; }
+  #settings-header { padding: 14px 18px; }
+  #settings-body { flex-direction: column; }
+  #settings-nav {
+    width: auto;
+    flex-direction: row;
+    border-right: none;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 8px 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-shrink: 0;
+  }
+  .settings-nav-btn { padding: 8px 12px 8px 20px; white-space: nowrap; }
+  .settings-nav-btn.active::before { left: 8px; }
+  #settings-panes { padding: 18px 18px 22px; }
+  .settings-shortcuts { grid-template-columns: 1fr; }
+  .shortcut-row:nth-last-child(2) { border-bottom: 1px solid #1e1e1e; }
+  .remote-form-row-pair,
+  .remote-form-row-pair-wide { grid-template-columns: 1fr; }
 }
 
 /* ── Collection source menu ── */
