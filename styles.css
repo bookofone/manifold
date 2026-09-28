@@ -1982,6 +1982,7 @@ body {
 .cond-ledger-verify.pass { background: #1c2620; color: #4e9a68; }
 .cond-ledger-verify.fail { background: #3a2526; color: #e5484d; }
 .cond-ledger-verify.running { color: #D97757; cursor: default; }
+.cond-ledger-verify.cond-ledger-merge { cursor: default; }
 .cond-ledger-label { color: #6a6a6a; letter-spacing: 0.06em; margin-top: 6px; }
 .cond-ledger-text { color: #9a9a9a; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; line-height: 1.4; }
 .cond-ledger-files { margin-top: 5px; max-height: 120px; overflow-y: auto; white-space: nowrap; }

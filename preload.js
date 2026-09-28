@@ -87,6 +87,7 @@ contextBridge.exposeInMainWorld('manifold', {
   // the path agents see, for the pointer line prepended to a dispatch.
   briefRead: (opts) => ipcRenderer.invoke('brief-read', opts),
   briefWrite: (opts) => ipcRenderer.invoke('brief-write', opts),
+  agentMerge: (opts) => ipcRenderer.invoke('agent-merge', opts),
 
   // UI Scale
   setZoomFactor: (factor) => webFrame.setZoomFactor(factor),
