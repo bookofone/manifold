@@ -29,6 +29,8 @@ const state = {
   // change reaches an open conductor the next time its tab is reopened.
   conductorModel: 'sonnet',
   agentModel: 'sonnet', // background agents, whether dispatched by the conductor or the button
+  // Finished-agent outcome records, by agent id. See "Agent ledger".
+  agentLedger: {},
 };
 
 // Terminal instances: tabId -> { terminal, fitAddon, element }
@@ -375,6 +377,10 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
       </div>
       <div class="cond-roster-list"></div>
       <div class="cond-roster-empty">No background agents.<br>Ask the conductor to dispatch one, or hit +.</div>
+      <div class="cond-history">
+        <button class="cond-history-toggle" title="Finished agents: what they were asked, changed, and whether verify passed"></button>
+        <div class="cond-history-list hidden"></div>
+      </div>
     </div>
   `;
 
@@ -411,6 +417,14 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
     targetHead: el.querySelector('.cond-target'),
     av: { log: el.querySelector('.cond-agent-view') },
     relays: [],
+    // Agent ledger views: completion-notice blocks by agent id, what is
+    // expanded, and full diffs fetched this session.
+    historyToggle: el.querySelector('.cond-history-toggle'),
+    historyList: el.querySelector('.cond-history-list'),
+    historyShown: false,
+    ledgerNotices: new Map(),
+    ledgerOpen: new Set(),
+    diffCache: new Map(),
   };
   conductorPanes.set(tabId, pane);
 
@@ -451,6 +465,11 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
     pane.showDone = !pane.showDone;
     refreshRoster(pane);
   });
+  pane.historyToggle.addEventListener('click', () => {
+    pane.historyShown = !pane.historyShown;
+    renderLedgerHistory(pane);
+  });
+  renderLedgerHistory(pane);
 
   // A restored tab replays its transcript first, so the feed doesn't come back
   // blank while the process is still starting.
@@ -1101,6 +1120,207 @@ function condAgentDone(pane, agent) {
 
   pane.pendingNotices.push(`[Manifold] Background agent ${agent.id} ("${agent.name || ''}") has finished.`);
   showToast(`Agent ${agent.id} finished`);
+  recordAgentOutcome(pane, agent, div);
+}
+
+// ── Agent ledger ──
+//
+// What each finished agent was asked, what it changed and whether it passes
+// the collection's verify command. Kept in state.agentLedger (by id), separate
+// from the roster, so `claude rm` / clear never takes the record with it. Full
+// diffs are not persisted: they are re-read from the worktree on demand.
+
+const LEDGER_MAX = 200;
+const LEDGER_TEXT_MAX = 4000;
+
+function paneCollection(pane) {
+  return state.collections.find((c) => c.tabs.some((t) => t.id === pane.tabId)) || null;
+}
+
+function ledgerPut(e) {
+  state.agentLedger[e.id] = e;
+  const ids = Object.keys(state.agentLedger);
+  if (ids.length > LEDGER_MAX) {
+    ids.sort((a, b) => (state.agentLedger[a].endedAt || 0) - (state.agentLedger[b].endedAt || 0));
+    for (const id of ids.slice(0, ids.length - LEDGER_MAX)) delete state.agentLedger[id];
+  }
+}
+
+// Two conductor panes on one path both see the same agent finish; only the
+// first records it (and runs verify), the other just shows the entry.
+const ledgerInFlight = new Set();
+
+async function recordAgentOutcome(pane, agent, notice) {
+  const block = document.createElement('div');
+  notice.after(block);
+  pane.ledgerNotices.set(agent.id, block);
+  if (ledgerInFlight.has(agent.id)) { ledgerRefresh(pane, agent.id); return; }
+  ledgerInFlight.add(agent.id);
+  try { await recordOutcome(pane, agent); } finally { ledgerInFlight.delete(agent.id); }
+}
+
+async function recordOutcome(pane, agent) {
+  const col = paneCollection(pane);
+  const cwd = agent.cwd || pane.cwd;
+  const e = {
+    id: agent.id,
+    name: agent.name || '',
+    prompt: agent.name || '',
+    cwd,
+    scope: pane.cwd,
+    remote: pane.remote || null,
+    startedAt: agent.startedAt || null,
+    endedAt: Date.now(),
+    summary: '',
+    branch: null,
+    worktree: null,
+    diff: null,
+    verify: col && col.verify ? { cmd: col.verify, status: 'running' } : null,
+  };
+  ledgerPut(e);
+  // Other panes showing this agent's notice re-render too.
+  const update = () => { for (const [, p] of conductorPanes) ledgerRefresh(p, e.id); saveState(); };
+  update();
+
+  const [tr, diff] = await Promise.all([
+    manifold.agentTranscript(agent.sessionId, cwd, pane.remote).catch(() => null),
+    manifold.agentDiff({ cwd, remote: pane.remote, startedAt: agent.startedAt }).catch(() => null),
+  ]);
+  if (tr && tr.ok) {
+    // A trimmed tail no longer starts at the task, so fall back to the name
+    // (itself derived from the prompt) rather than record a mid-run message.
+    const first = !tr.truncated && tr.entries.find((x) => x.role === 'user');
+    if (first) e.prompt = first.text.slice(0, LEDGER_TEXT_MAX);
+    const last = tr.entries.filter((x) => x.role === 'assistant').pop();
+    if (last) e.summary = last.text.slice(0, LEDGER_TEXT_MAX);
+  }
+  if (diff && diff.ok) {
+    e.branch = diff.branch;
+    e.worktree = diff.worktree;
+    e.diff = { fileCount: diff.fileCount, added: diff.added, deleted: diff.deleted, untracked: diff.untracked, files: diff.files, base: diff.base };
+  } else {
+    e.diff = { error: (diff && diff.error) || 'diff unavailable' };
+  }
+  update();
+
+  if (!e.verify) return;
+  const v = await manifold.agentVerify({ cwd, cmd: e.verify.cmd, remote: pane.remote }).catch((err) => ({ ok: false, error: String(err) }));
+  if (!v || !v.ok) {
+    e.verify = { cmd: e.verify.cmd, status: 'error', tail: (v && v.error) || 'verify failed to run' };
+  } else {
+    e.verify = { cmd: e.verify.cmd, status: v.pass ? 'pass' : 'fail', code: v.code, timedOut: v.timedOut, ms: v.ms, tail: v.tail };
+  }
+  update();
+
+  const word = e.verify.status === 'pass' ? 'PASS' : 'FAIL';
+  const how = e.verify.timedOut ? 'timed out' : e.verify.code != null ? `exit ${e.verify.code}` : e.verify.status;
+  pane.pendingNotices.push(`[Manifold] verify: ${word} for agent ${e.id} (\`${e.verify.cmd}\`, ${how})`);
+  if (word === 'FAIL') showToast(`Agent ${e.id} verify FAIL`, true);
+}
+
+function ledgerStatHtml(e) {
+  const d = e.diff;
+  if (!d) return '<span class="cond-ledger-dim">diff…</span>';
+  if (d.error) return `<span class="cond-ledger-dim">diff unavailable (${escHtml(d.error)})</span>`;
+  const files = `${d.fileCount} file${d.fileCount === 1 ? '' : 's'}`;
+  const untracked = d.untracked ? ` <span class="cond-ledger-dim">+${d.untracked} untracked</span>` : '';
+  return `<span class="cond-ledger-diff" title="Diff vs ${escAttr(d.base || '')} — click for the full diff">${files} <span class="cond-ledger-add">+${d.added}</span> <span class="cond-ledger-del">−${d.deleted}</span></span>${untracked}`;
+}
+
+function ledgerVerifyHtml(e) {
+  const v = e.verify;
+  if (!v) return '';
+  if (v.status === 'running') return `<span class="cond-ledger-verify running" title="${escAttr(v.cmd)}">verify…</span>`;
+  const label = v.status === 'pass' ? 'PASS' : v.status === 'error' ? 'ERROR' : 'FAIL';
+  return `<span class="cond-ledger-verify ${v.status === 'pass' ? 'pass' : 'fail'}" title="${escAttr(v.cmd)} — click for output">${label}</span>`;
+}
+
+// One renderer for the completion notice's block and a history entry. `key`
+// namespaces what is expanded, so the two can be opened independently.
+function renderLedgerBlock(pane, el, e, key, withDetail) {
+  const open = pane.ledgerOpen;
+  const diffOpen = open.has(key + ':diff');
+  const verifyOpen = open.has(key + ':verify');
+  const cached = pane.diffCache.get(e.id);
+  let html = `<div class="cond-ledger-row">${ledgerVerifyHtml(e)}${ledgerStatHtml(e)}${e.branch ? `<span class="cond-ledger-dim cond-ledger-branch" title="${escAttr(e.worktree || '')}">${escHtml(e.branch)}</span>` : ''}</div>`;
+  if (withDetail) {
+    html += `<div class="cond-ledger-label">asked</div><div class="cond-ledger-text">${escHtml(e.prompt || '(unknown)')}</div>`;
+    if (e.summary) html += `<div class="cond-ledger-label">result</div><div class="cond-ledger-text">${escHtml(e.summary)}</div>`;
+    html += `<div class="cond-ledger-dim">${escHtml(e.worktree || e.cwd || '')}${e.startedAt ? ' · ' + escHtml(fmtDuration(e.endedAt - e.startedAt)) : ''}</div>`;
+    if (e.diff && e.diff.files && e.diff.files.length) {
+      html += `<div class="cond-ledger-files">${e.diff.files.map((f) => `<div><span class="cond-ledger-add">${f.add == null ? 'bin' : '+' + f.add}</span> <span class="cond-ledger-del">${f.del == null ? '' : '−' + f.del}</span> ${escHtml(f.path)}</div>`).join('')}${e.diff.fileCount > e.diff.files.length ? `<div class="cond-ledger-dim">…${e.diff.fileCount - e.diff.files.length} more</div>` : ''}</div>`;
+    }
+  }
+  if (verifyOpen && e.verify && e.verify.tail != null) {
+    html += `<div class="cond-ledger-label">${escHtml(e.verify.cmd)}${e.verify.code != null ? ' · exit ' + e.verify.code : ''}</div><pre class="cond-ledger-pre">${escHtml(e.verify.tail || '(no output)')}</pre>`;
+  }
+  if (diffOpen) {
+    html += !cached ? '<div class="cond-ledger-dim">loading diff…</div>'
+      : cached.error ? `<div class="cond-ledger-dim">diff unavailable (${escHtml(cached.error)})</div>`
+      : `<pre class="cond-ledger-pre cond-ledger-fulldiff">${escHtml(cached.diff || '(no changes)')}</pre>${cached.truncated ? '<div class="cond-ledger-dim">…diff truncated at 200KB</div>' : ''}`;
+  }
+  el.className = 'cond-ledger';
+  el.innerHTML = html;
+
+  const toggle = (k) => { if (open.has(k)) open.delete(k); else open.add(k); renderLedgerBlock(pane, el, e, key, withDetail); };
+  const d = el.querySelector('.cond-ledger-diff');
+  if (d) d.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    toggle(key + ':diff');
+    if (!open.has(key + ':diff') || pane.diffCache.has(e.id)) return;
+    const r = await manifold.agentDiff({ cwd: e.cwd, remote: e.remote, startedAt: e.startedAt, full: true }).catch(() => null);
+    pane.diffCache.set(e.id, r && r.ok ? { diff: r.diff, truncated: r.truncated } : { error: (r && r.error) || 'diff failed' });
+    renderLedgerBlock(pane, el, e, key, withDetail);
+  });
+  const v = el.querySelector('.cond-ledger-verify:not(.running)');
+  if (v) v.addEventListener('click', (ev) => { ev.stopPropagation(); toggle(key + ':verify'); });
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+}
+
+function ledgerRefresh(pane, id) {
+  const e = state.agentLedger[id];
+  const block = pane.ledgerNotices.get(id);
+  if (e && block && block.isConnected) {
+    const atBottom = pane.log.scrollHeight - pane.log.scrollTop - pane.log.clientHeight < 40;
+    renderLedgerBlock(pane, block, e, 'n:' + id, false);
+    if (atBottom) condScroll(pane);
+  }
+  renderLedgerHistory(pane);
+}
+
+// History under the roster: this pane's finished agents, newest first.
+function renderLedgerHistory(pane) {
+  const entries = Object.values(state.agentLedger)
+    .filter((e) => e.scope === pane.cwd && (e.remote || null) === pane.remote)
+    .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+  pane.historyToggle.textContent = `${pane.historyShown ? '▼' : '▶'} history${entries.length ? ' · ' + entries.length : ''}`;
+  pane.historyList.classList.toggle('hidden', !pane.historyShown);
+  if (!pane.historyShown) return;
+  pane.historyList.innerHTML = entries.length ? '' : '<div class="cond-roster-empty">No finished agents recorded yet.</div>';
+  for (const e of entries) {
+    const key = 'h:' + e.id;
+    const item = document.createElement('div');
+    item.className = 'cond-history-item';
+    const head = document.createElement('div');
+    head.className = 'cond-agent-top';
+    head.innerHTML = `<span class="cond-agent-id">${escHtml(e.id)}</span><span class="cond-agent-status">${escHtml(fmtAgo(e.endedAt))}</span>`;
+    head.title = 'Click for details';
+    const name = document.createElement('div');
+    name.className = 'cond-agent-name';
+    name.textContent = e.name || e.prompt || '(no prompt)';
+    const block = document.createElement('div');
+    const expanded = pane.ledgerOpen.has(key);
+    const onClick = () => { if (expanded) pane.ledgerOpen.delete(key); else pane.ledgerOpen.add(key); renderLedgerHistory(pane); };
+    head.addEventListener('click', onClick);
+    name.addEventListener('click', onClick);
+    item.append(head, name, block);
+    renderLedgerBlock(pane, block, e, key, expanded);
+    pane.historyList.appendChild(item);
+  }
 }
 
 // Deleting a finished agent is one click: it is a spent session and a cluttered
@@ -1295,6 +1515,7 @@ function renderCollections() {
               <button class="add-menu-item conductor-btn" data-ci="${ci}"><span class="add-menu-icon">&#x25C9;</span> Conductor</button>
               ${(col.commands || []).map((cmd, cmdI) => `<button class="add-menu-item cmd-btn" data-ci="${ci}" data-cmdi="${cmdI}" title="${escAttr(cmd.cmd)}"><span class="add-menu-icon">&#x26A1;</span> ${escHtml(cmd.name)}</button>`).join('')}
               <button class="add-menu-item addcmd-btn" data-ci="${ci}"><span class="add-menu-icon">+</span> Add command</button>
+              <button class="add-menu-item verify-btn" data-ci="${ci}" title="Run after each background agent finishes, in its worktree"><span class="add-menu-icon">&#x2713;</span> ${col.verify ? 'Verify: ' + escHtml(col.verify) : 'Set verify command'}</button>
             </div>
           </div>
         </div>
@@ -1533,6 +1754,8 @@ function bindCollectionEvents() {
         }
       } else if (el.classList.contains('addcmd-btn')) {
         addCommandToCollection(ci);
+      } else if (el.classList.contains('verify-btn')) {
+        setCollectionVerify(ci);
       }
     });
 
@@ -1745,7 +1968,7 @@ function launchCommand(ci, command) {
 }
 
 // ── Input dialog helper ──
-function showInputDialog(title, placeholder) {
+function showInputDialog(title, placeholder, opts = {}) {
   return new Promise((resolve) => {
     const overlay = document.getElementById('input-dialog-overlay');
     const titleEl = document.getElementById('input-dialog-title');
@@ -1754,7 +1977,7 @@ function showInputDialog(title, placeholder) {
     const cancelBtn = document.getElementById('input-dialog-cancel');
 
     titleEl.textContent = title;
-    field.value = '';
+    field.value = opts.value || '';
     field.placeholder = placeholder || '';
     overlay.classList.remove('hidden');
     field.focus();
@@ -1768,11 +1991,13 @@ function showInputDialog(title, placeholder) {
       resolve(val);
     }
 
-    okBtn.onclick = () => cleanup(field.value.trim() || null);
+    // allowEmpty: an empty OK resolves '' (clear), distinct from cancel (null).
+    const ok = () => cleanup(opts.allowEmpty ? field.value.trim() : (field.value.trim() || null));
+    okBtn.onclick = ok;
     cancelBtn.onclick = () => cleanup(null);
     overlay.onclick = (e) => { if (e.target === overlay) cleanup(null); };
     field.onkeydown = (e) => {
-      if (e.key === 'Enter') cleanup(field.value.trim() || null);
+      if (e.key === 'Enter') ok();
       if (e.key === 'Escape') cleanup(null);
     };
   });
@@ -1829,6 +2054,18 @@ async function addCommandToCollection(ci) {
 
   if (!col.commands) col.commands = [];
   col.commands.push({ name, cmd });
+  renderCollections();
+  saveState();
+}
+
+// Optional per-collection check (e.g. `npm test`) that main runs in a finished
+// agent's worktree; the result lands on its completion notice and ledger entry.
+async function setCollectionVerify(ci) {
+  const col = state.collections[ci];
+  if (!col) return;
+  const cmd = await showInputDialog('Verify command (empty to turn off)', 'e.g. npm test', { value: col.verify || '', allowEmpty: true });
+  if (cmd === null) return;
+  col.verify = cmd || null;
   renderCollections();
   saveState();
 }
@@ -2137,6 +2374,7 @@ async function saveState() {
       expanded: col.expanded,
       gridded: col.gridded || false,
       commands: col.commands || [],
+      verify: col.verify || null,
       tabs: col.tabs.map((t) => ({
         name: t.name,
         cwd: t.cwd,
@@ -2157,6 +2395,7 @@ async function saveState() {
     conductorBirth: state.conductorBirth,
     conductorModel: state.conductorModel,
     agentModel: state.agentModel,
+    agentLedger: state.agentLedger,
     remotes: state.remotes,
   };
   await manifold.saveState(data);
@@ -3444,6 +3683,7 @@ async function restoreFromState(data) {
       expanded: colData.expanded !== false,
       gridded: colData.gridded || false,
       commands: colData.commands || [],
+      verify: colData.verify || null,
       tabs: [],
     };
 
@@ -3517,6 +3757,13 @@ async function restoreFromState(data) {
     renderConductorBirth();
     if (savedState && savedState.conductorModel) state.conductorModel = savedState.conductorModel;
     if (savedState && savedState.agentModel) state.agentModel = savedState.agentModel;
+    if (savedState && savedState.agentLedger) {
+      state.agentLedger = savedState.agentLedger;
+      // A verify still "running" at save time was cut off by the app closing.
+      for (const e of Object.values(state.agentLedger)) {
+        if (e.verify && e.verify.status === 'running') e.verify = { cmd: e.verify.cmd, status: 'error', tail: 'interrupted \u2014 Manifold closed before verify finished' };
+      }
+    }
     renderConductorModel();
     renderAgentModel();
     // Restore remote destinations

@@ -935,7 +935,7 @@ function runCmd(bin, args, opts = {}) {
 
     proc.on('close', code => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, stdout: stdout.trim(), stderr: stderr.trim() });
+      resolve({ ok: code === 0, code, stdout: stdout.trim(), stderr: stderr.trim() });
     });
 
     proc.on('error', (err) => {
@@ -1777,6 +1777,127 @@ ipcMain.handle('agent-remove', async (event, { id, cwd, remote }) => {
 ipcMain.handle('agent-stop', async (event, { id, cwd, remote }) => {
   const res = await runClaude(remote, cwd, ['stop', id], 10000);
   return { ok: res.ok, error: res.ok ? null : (res.stderr || 'stop failed') };
+});
+
+// ── Agent outcomes: diff + verify ──
+//
+// Both run as one shell script so the same text works locally (bash, or bash
+// inside WSL on Windows) and on a remote host over ssh. The script cd's into
+// the agent's cwd itself: the path Claude reports is already a WSL/remote path.
+function runLocalSh(script, opts = {}) {
+  if (IS_WIN) {
+    // Same base64 carriage as wslArgv — a raw script would be re-parsed by the
+    // shell wsl.exe hands its command line to.
+    const b64 = Buffer.from(script, 'utf-8').toString('base64');
+    return runCmd('-e', ['bash', '-lc', `eval "$(echo ${b64} | base64 -d)"`], opts);
+  }
+  return runCmd('bash', ['-lc', script], opts);
+}
+
+function runAgentSh(remote, script, timeout) {
+  return remote ? runRemoteCmd(remote, script, { timeout }) : runLocalSh(script, { timeout });
+}
+
+const DIFF_MAX_BYTES = 200 * 1024;
+const DIFF_MAX_FILES = 50;
+
+// The base an agent's work is measured against:
+//   - on a branch other than the default (a worktree, or a branch it made):
+//     merge-base with the default branch, so committed and uncommitted work
+//     both count and whatever landed on main since does not;
+//   - on the default branch itself: the last commit before the agent started,
+//     so its own commits count;
+//   - otherwise plain HEAD — uncommitted changes only.
+// Every case diffs base against the working tree. Untracked files never show
+// in `git diff`; they are counted separately rather than added with -N, which
+// would touch the agent's index.
+ipcMain.handle('agent-diff', async (event, { cwd, remote, startedAt, full }) => {
+  if (!cwd) return { ok: false, error: 'no cwd' };
+  const dir = remote ? cwd : winToWslPath(cwd);
+  const start = Math.floor((startedAt || 0) / 1000);
+  const script = [
+    `cd ${shQuote(dir)} 2>/dev/null || { echo '@@MF gone'; exit 0; }`,
+    `git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo '@@MF nogit'; exit 0; }`,
+    `br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)`,
+    `def=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')`,
+    `[ -n "$def" ] && git rev-parse --verify --quiet "refs/heads/$def" >/dev/null || def=`,
+    `[ -z "$def" ] && for b in main master; do git rev-parse --verify --quiet "refs/heads/$b" >/dev/null && { def=$b; break; }; done`,
+    `base=; how=`,
+    `[ -n "$def" ] && [ "$br" != "$def" ] && base=$(git merge-base HEAD "$def" 2>/dev/null) && how="merge-base with $def"`,
+    `[ -z "$base" ] && [ ${start} -gt 0 ] && base=$(git rev-list -1 --before=@${start} HEAD 2>/dev/null) && [ -n "$base" ] && how="HEAD at agent start"`,
+    `[ -z "$base" ] && { base=HEAD; how="uncommitted only"; }`,
+    `gd=$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P); gc=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)`,
+    `wt=; [ "$gd" != "$gc" ] && wt=$(git rev-parse --show-toplevel)`,
+    `echo '@@MF ok'; echo "$br"; echo "$wt"; echo "$how"`,
+    `echo '@@MF files'; git diff --numstat "$base" | head -n ${DIFF_MAX_FILES}`,
+    `echo '@@MF total'; git diff --shortstat "$base"; echo; git diff --name-only "$base" | wc -l`,
+    `echo '@@MF untracked'; git ls-files --others --exclude-standard | wc -l`,
+    full ? `echo '@@MF diff'; git diff "$base" | head -c ${DIFF_MAX_BYTES + 1}` : '',
+  ].join('\n');
+
+  const res = await runAgentSh(remote, script, full ? 30000 : 15000);
+  const out = String(res.stdout || '');
+  if (/^@@MF gone/m.test(out)) return { ok: false, error: 'worktree removed' };
+  if (/^@@MF nogit/m.test(out)) return { ok: false, error: 'not a git repo' };
+  if (!/^@@MF ok/m.test(out)) return { ok: false, error: (res.stderr || 'diff failed').trim().slice(0, 300) };
+
+  // Sections are fenced by marker lines, as in remoteActivity.
+  const sec = {};
+  for (const chunk of out.split(/^@@MF /m)) {
+    const nl = chunk.indexOf('\n');
+    if (nl !== -1) sec[chunk.slice(0, nl).trim()] = chunk.slice(nl + 1);
+    else if (chunk.trim()) sec[chunk.trim()] = '';
+  }
+  const [branch, worktree, base] = (sec.ok || '').split('\n');
+  const files = (sec.files || '').split('\n').filter((l) => l.trim()).map((l) => {
+    const [a, d, ...p] = l.split('\t');
+    return { path: p.join('\t'), add: a === '-' ? null : +a, del: d === '-' ? null : +d };
+  });
+  const total = (sec.total || '').trim().split('\n');
+  const shortstat = total[0] || '';
+  const num = (re) => +((shortstat.match(re) || [])[1] || 0);
+  const r = {
+    ok: true,
+    branch: branch || null,
+    worktree: worktree || null,
+    base: base || null,
+    files,
+    fileCount: parseInt(total[total.length - 1], 10) || 0,
+    added: num(/(\d+) insertion/),
+    deleted: num(/(\d+) deletion/),
+    untracked: parseInt(sec.untracked, 10) || 0,
+  };
+  if (full) {
+    const d = sec.diff || '';
+    r.truncated = d.length > DIFF_MAX_BYTES;
+    r.diff = d.slice(0, DIFF_MAX_BYTES);
+  }
+  return r;
+});
+
+// Run a collection's verify command (e.g. `npm test`) in the agent's cwd: a
+// login shell so the user's PATH has node/npm, stderr folded into the tail. On
+// timeout the local ssh/wsl end is killed; a remote command may outlive it.
+const VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
+const VERIFY_TAIL_CHARS = 3000;
+ipcMain.handle('agent-verify', async (event, { cwd, cmd, remote }) => {
+  if (!cwd || !cmd) return { ok: false, error: 'no cwd or command' };
+  const dir = remote ? cwd : winToWslPath(cwd);
+  const script = `cd ${shQuote(dir)} 2>/dev/null || { echo 'worktree removed'; exit 97; }\n{ ${cmd}\n} 2>&1`;
+  const t0 = Date.now();
+  const res = await runAgentSh(remote, script, VERIFY_TIMEOUT_MS);
+  const timedOut = res.code === undefined && res.stderr === 'Timeout';
+  let tail = String(res.stdout || '');
+  if (timedOut) tail += '\n[timed out after 5 min]';
+  else if (res.code !== 0 && res.stderr) tail += '\n' + res.stderr; // ssh/wsl's own errors
+  return {
+    ok: true,
+    pass: res.code === 0,
+    code: typeof res.code === 'number' ? res.code : null,
+    timedOut,
+    ms: Date.now() - t0,
+    tail: tail.slice(-VERIFY_TAIL_CHARS),
+  };
 });
 
 // ── App lifecycle ──

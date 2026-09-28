@@ -79,6 +79,10 @@ contextBridge.exposeInMainWorld('manifold', {
   agentLogs: (id, cwd, remote) => ipcRenderer.invoke('agent-logs', { id, cwd, remote }),
   agentStop: (id, cwd, remote) => ipcRenderer.invoke('agent-stop', { id, cwd, remote }),
   agentRemove: (opts) => ipcRenderer.invoke('agent-remove', opts),
+  // Outcome record: git diff against the agent's base, and the collection's
+  // optional verify command, both run in the agent's cwd (over ssh if remote).
+  agentDiff: (opts) => ipcRenderer.invoke('agent-diff', opts),
+  agentVerify: (opts) => ipcRenderer.invoke('agent-verify', opts),
 
   // UI Scale
   setZoomFactor: (factor) => webFrame.setZoomFactor(factor),

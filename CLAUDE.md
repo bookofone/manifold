@@ -54,6 +54,16 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   conductor to SendMessage the text verbatim. Either way the bubble stays "pending" until the
   text appears in the agent transcript, and fails visibly after 2 min (or, for relays, if the
   conductor exits).
+- **Agent ledger / diff / verify**: when the roster sees an agent go `done`, the renderer records
+  `state.agentLedger[id]` (prompt = first user entry of its transcript, final assistant message,
+  cwd, branch/worktree, start/end, diff stats, verify result; capped at 200, persisted, never
+  touched by `claude rm`/clear). `agent-diff` runs one shell script in the agent's cwd (bash
+  locally, WSL on Windows, ssh on remote): base is merge-base with the default branch when on
+  another branch, else the last commit before the agent started, diffed against the working tree;
+  full diffs are fetched on click, capped at 200KB, never persisted. A collection's optional
+  `verify` command (add menu → "Set verify command") runs via `agent-verify` in the same cwd with a
+  5 min timeout; PASS/FAIL shows on the notice and history entry, and
+  `[Manifold] verify: PASS|FAIL for agent <id>` is queued into the conductor's pending notices.
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work
