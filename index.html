@@ -54,6 +54,7 @@
           <div id="settings-body">
             <nav id="settings-nav">
               <button class="settings-nav-btn active" data-pane="general">General</button>
+              <button class="settings-nav-btn" data-pane="agents">Agents</button>
               <button class="settings-nav-btn" data-pane="remotes">Remotes</button>
               <button class="settings-nav-btn" data-pane="shortcuts">Shortcuts</button>
               <button class="settings-nav-btn" data-pane="about">About</button>
@@ -92,6 +93,11 @@
                     <button class="seg-btn" data-source="conductor">Conductor</button>
                   </div>
                 </div>
+              </div>
+            </section>
+            <section class="settings-pane" data-pane="agents">
+              <div class="settings-group">
+                <div class="settings-section-title">CONDUCTOR</div>
                 <div class="settings-row">
                   <div class="settings-row-text">
                     <span class="settings-label">Conductor on open</span>
@@ -103,9 +109,6 @@
                     <button class="seg-btn" data-birth="off">Nothing</button>
                   </div>
                 </div>
-              </div>
-              <div class="settings-group">
-                <div class="settings-section-title">MODELS</div>
                 <div class="settings-row">
                   <div class="settings-row-text">
                     <span class="settings-label">Conductor model</span>
@@ -132,6 +135,9 @@
                   </select>
                   <input id="conductor-model-custom" type="text" class="remote-form-input model-custom hidden" placeholder="Exact model name" autocomplete="off" spellcheck="false">
                 </div>
+              </div>
+              <div class="settings-group">
+                <div class="settings-section-title">BACKGROUND AGENTS</div>
                 <div class="settings-row">
                   <div class="settings-row-text">
                     <span class="settings-label">Agent model</span>
