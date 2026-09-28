@@ -1866,13 +1866,10 @@ const DIFF_MAX_FILES = 50;
 // Every case diffs base against the working tree. Untracked files never show
 // in `git diff`; they are counted separately rather than added with -N, which
 // would touch the agent's index.
-ipcMain.handle('agent-diff', async (event, { cwd, remote, startedAt, full }) => {
-  if (!cwd) return { ok: false, error: 'no cwd' };
-  const dir = remote ? cwd : winToWslPath(cwd);
+// Sets $br, $def (default branch), $base and $how (see above) in the agent's cwd.
+function diffBaseSh(startedAt) {
   const start = Math.floor((startedAt || 0) / 1000);
-  const script = [
-    `cd ${shQuote(dir)} 2>/dev/null || { echo '@@MF gone'; exit 0; }`,
-    `git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo '@@MF nogit'; exit 0; }`,
+  return [
     `br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)`,
     `def=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')`,
     `[ -n "$def" ] && git rev-parse --verify --quiet "refs/heads/$def" >/dev/null || def=`,
@@ -1881,6 +1878,16 @@ ipcMain.handle('agent-diff', async (event, { cwd, remote, startedAt, full }) => 
     `[ -n "$def" ] && [ "$br" != "$def" ] && base=$(git merge-base HEAD "$def" 2>/dev/null) && how="merge-base with $def"`,
     `[ -z "$base" ] && [ ${start} -gt 0 ] && base=$(git rev-list -1 --before=@${start} HEAD 2>/dev/null) && [ -n "$base" ] && how="HEAD at agent start"`,
     `[ -z "$base" ] && { base=HEAD; how="uncommitted only"; }`,
+  ].join('\n');
+}
+
+ipcMain.handle('agent-diff', async (event, { cwd, remote, startedAt, full }) => {
+  if (!cwd) return { ok: false, error: 'no cwd' };
+  const dir = remote ? cwd : winToWslPath(cwd);
+  const script = [
+    `cd ${shQuote(dir)} 2>/dev/null || { echo '@@MF gone'; exit 0; }`,
+    `git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo '@@MF nogit'; exit 0; }`,
+    diffBaseSh(startedAt),
     `gd=$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P); gc=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)`,
     `wt=; [ "$gd" != "$gc" ] && wt=$(git rev-parse --show-toplevel)`,
     `echo '@@MF ok'; echo "$br"; echo "$wt"; echo "$how"`,
@@ -1930,24 +1937,56 @@ ipcMain.handle('agent-diff', async (event, { cwd, remote, startedAt, full }) => 
   return r;
 });
 
-// Run a collection's verify command (e.g. `npm test`) in the agent's cwd: a
-// login shell so the user's PATH has node/npm, stderr folded into the tail. On
-// timeout the local ssh/wsl end is killed; a remote command may outlive it.
+// Run a verify check in the agent's cwd: a login shell so the user's PATH has
+// node/npm, stderr folded into the tail. On timeout the local ssh/wsl end is
+// killed; a remote command may outlive it. With no `cmd` the check is detected
+// in the same script: a real package.json "test" script runs `npm test`, else
+// `node --check` on every existing .js/.mjs/.cjs file the agent changed or
+// added (diff base as in agent-diff, untracked included), else nothing to
+// check, which passes. Its first two lines (`@@MF cmd`, `@@MF run`) say what ran.
 const VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
 const VERIFY_TAIL_CHARS = 3000;
-ipcMain.handle('agent-verify', async (event, { cwd, cmd, remote }) => {
-  if (!cwd || !cmd) return { ok: false, error: 'no cwd or command' };
+function verifyDetectSh(startedAt) {
+  return [
+    diffBaseSh(startedAt),
+    `if [ -f package.json ] && node -e 'const t=((require("./package.json").scripts)||{}).test; process.exit(t && !/no test specified/.test(t) ? 0 : 1)' 2>/dev/null; then`,
+    `  echo '@@MF cmd npm test'; echo '@@MF run npm test'; npm test; exit $?`,
+    `fi`,
+    `files=$({ git -c core.quotePath=false diff --relative --name-only --diff-filter=d "$base" 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | grep -E '\\.(js|mjs|cjs)$' | sort -u | while IFS= read -r f; do [ -f "$f" ] && printf '%s\\n' "$f"; done)`,
+    `n=$(printf '%s' "$files" | grep -c .)`,
+    `if [ "$n" -eq 0 ]; then echo '@@MF cmd no checks found'; echo '@@MF run'; echo 'no package.json test script and no changed .js/.mjs/.cjs files'; exit 0; fi`,
+    `s=s; [ "$n" -eq 1 ] && s=`,
+    `echo "@@MF cmd node --check ($n file$s)"; echo "@@MF run node --check on each of: $(printf '%s' "$files" | tr '\\n' ' ')"`,
+    `rc=0`,
+    `while IFS= read -r f; do node --check "$f" || { echo "FAIL: $f"; rc=1; }; done <<MF_FILES`,
+    `$files`,
+    `MF_FILES`,
+    `[ $rc -eq 0 ] && echo "ok: $n file$s parsed"`,
+    `exit $rc`,
+  ].join('\n');
+}
+
+ipcMain.handle('agent-verify', async (event, { cwd, cmd, remote, startedAt }) => {
+  if (!cwd) return { ok: false, error: 'no cwd' };
   const dir = remote ? cwd : winToWslPath(cwd);
-  const script = `cd ${shQuote(dir)} 2>/dev/null || { echo 'worktree removed'; exit 97; }\n{ ${cmd}\n} 2>&1`;
+  const body = cmd ? `{ ${cmd}\n} 2>&1` : `{\n${verifyDetectSh(startedAt)}\n} 2>&1`;
+  const script = `cd ${shQuote(dir)} 2>/dev/null || { echo 'worktree removed'; exit 97; }\n${body}`;
   const t0 = Date.now();
   const res = await runAgentSh(remote, script, VERIFY_TIMEOUT_MS);
   const timedOut = res.code === undefined && res.stderr === 'Timeout';
   let tail = String(res.stdout || '');
+  let label = cmd || 'auto-detect';
+  let run = cmd || '';
+  const m = !cmd && tail.match(/^@@MF cmd (.*)\n@@MF run ?(.*)\n?/m);
+  if (m) { label = m[1]; run = m[2]; tail = tail.slice(0, m.index) + tail.slice(m.index + m[0].length); }
   if (timedOut) tail += '\n[timed out after 5 min]';
   else if (res.code !== 0 && res.stderr) tail += '\n' + res.stderr; // ssh/wsl's own errors
   return {
     ok: true,
     pass: res.code === 0,
+    cmd: label,
+    run,
+    none: !cmd && label === 'no checks found',
     code: typeof res.code === 'number' ? res.code : null,
     timedOut,
     ms: Date.now() - t0,

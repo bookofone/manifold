@@ -1137,7 +1137,7 @@ function condAgentDone(pane, agent) {
 // ── Agent ledger ──
 //
 // What each finished agent was asked, what it changed and whether it passes
-// the collection's verify command. Kept in state.agentLedger (by id), separate
+// its verify check. Kept in state.agentLedger (by id), separate
 // from the roster, so `claude rm` / clear never takes the record with it. Full
 // diffs are not persisted: they are re-read from the worktree on demand.
 
@@ -1188,7 +1188,7 @@ async function recordOutcome(pane, agent) {
     branch: null,
     worktree: null,
     diff: null,
-    verify: col && col.verify ? { cmd: col.verify, status: 'running' } : null,
+    verify: verifyOff(col) ? null : { cmd: verifyCmd(col) || 'auto', status: 'running' },
   };
   // Finishing again after an auto-fix: same task, so keep the ask and the count.
   if (prev && prev.autofix) { e.prompt = prev.prompt; e.autofix = { attempts: prev.autofix.attempts, max: prev.autofix.max }; }
@@ -1219,20 +1219,20 @@ async function recordOutcome(pane, agent) {
   update();
 
   if (!e.verify) return;
-  const v = await manifold.agentVerify({ cwd, cmd: e.verify.cmd, remote: pane.remote }).catch((err) => ({ ok: false, error: String(err) }));
+  const v = await manifold.agentVerify({ cwd, cmd: verifyCmd(col), remote: pane.remote, startedAt: agent.startedAt }).catch((err) => ({ ok: false, error: String(err) }));
   if (!v || !v.ok) {
     e.verify = { cmd: e.verify.cmd, status: 'error', tail: (v && v.error) || 'verify failed to run' };
   } else {
-    e.verify = { cmd: e.verify.cmd, status: v.pass ? 'pass' : 'fail', code: v.code, timedOut: v.timedOut, ms: v.ms, tail: v.tail };
+    e.verify = { cmd: v.cmd, run: v.run, none: v.none || undefined, status: v.pass ? 'pass' : 'fail', code: v.code, timedOut: v.timedOut, ms: v.ms, tail: v.tail };
   }
   update();
 
   // Auto-fix: hand the failure back to the same agent. Its next done re-runs
   // verify through here; only an exhausted (or undeliverable) fix is reported.
-  if (e.verify.status === 'fail' && col && col.autofix) {
+  if (e.verify.status === 'fail') {
     const n = (e.autofix && e.autofix.attempts) || 0;
-    e.autofix = { attempts: n, max: col.autofix };
-    if (n < col.autofix) {
+    e.autofix = { attempts: n, max: AUTOFIX_MAX };
+    if (n < AUTOFIX_MAX) {
       e.autofix.attempts = n + 1;
       update();
       const err = await autofixAgent(pane, agent, e);
@@ -1250,9 +1250,9 @@ async function recordOutcome(pane, agent) {
   const fix = !e.autofix ? '' : e.autofix.exhausted ? ` \u2014 autofix exhausted (${e.autofix.max} attempts)`
     : e.autofix.error ? ` \u2014 autofix could not reach the agent: ${e.autofix.error}`
     : e.autofix.attempts ? ` after ${e.autofix.attempts} autofix attempt${e.autofix.attempts === 1 ? '' : 's'}` : '';
-  pane.pendingNotices.push(`[Manifold] verify: ${word} for agent ${e.id} (\`${e.verify.cmd}\`, ${how})${fix}`);
+  pane.pendingNotices.push(`[Manifold] verify: ${word} for agent ${e.id} (${e.verify.none ? 'no checks found' : `\`${e.verify.cmd}\`, ${how}`})${fix}`);
   if (word === 'FAIL') showToast(`Agent ${e.id} verify FAIL${e.autofix && e.autofix.exhausted ? ' \u00b7 autofix exhausted' : ''}`, true);
-  if (word === 'PASS' && col && col.automerge) await automergeAgent(pane, agent, e, update);
+  if (word === 'PASS') await automergeAgent(pane, agent, e, update);
 }
 
 // Send the verify failure to the agent itself: straight into its inbox when
@@ -1261,9 +1261,10 @@ async function recordOutcome(pane, agent) {
 // Returns an error string when it could not be sent at all.
 async function autofixAgent(pane, agent, e) {
   const v = e.verify;
-  const text = `Manifold auto-fix, attempt ${e.autofix.attempts} of ${e.autofix.max}: the collection's verify command failed after you finished.\n` +
-    `Command: ${v.cmd}\n${v.timedOut ? 'Result: timed out after 5 minutes' : `Exit code: ${v.code}`}\nOutput (tail):\n${v.tail || '(no output)'}\n\n` +
-    `Fix the failure in your current worktree (${e.worktree || e.cwd}). Re-run \`${v.cmd}\` yourself until it passes, commit your changes, and finish. Do not push.`;
+  const run = v.run || v.cmd;
+  const text = `Manifold auto-fix, attempt ${e.autofix.attempts} of ${e.autofix.max}: Manifold's verify check failed after you finished.\n` +
+    `Command: ${run}\n${v.timedOut ? 'Result: timed out after 5 minutes' : `Exit code: ${v.code}`}\nOutput (tail):\n${v.tail || '(no output)'}\n\n` +
+    `Fix the failure in your current worktree (${e.worktree || e.cwd}). Re-run \`${run}\` yourself until it passes, commit your changes, and finish. Do not push.`;
   pane.fixing.add(agent.id);
   condSysLine(pane, `verify FAIL for ${agent.id} \u2014 sending auto-fix ${e.autofix.attempts}/${e.autofix.max} to the agent`);
   if (!pane.remote) {
@@ -1338,7 +1339,8 @@ function ledgerVerifyHtml(e) {
   const label = v.status === 'pass' ? 'PASS' : v.status === 'error' ? 'ERROR' : 'FAIL';
   const f = e.autofix;
   const fix = f && f.attempts ? ` · fix ${f.attempts}/${f.max}${f.exhausted ? ' exhausted' : ''}` : '';
-  return `<span class="cond-ledger-verify ${v.status === 'pass' ? 'pass' : 'fail'}" title="${escAttr(v.cmd)} — click for output">${label}${fix}</span>${ledgerMergeHtml(e)}`;
+  const cmd = v.cmd && v.cmd !== 'auto' ? ` · ${v.cmd.length > 40 ? v.cmd.slice(0, 39) + '\u2026' : v.cmd}` : '';
+  return `<span class="cond-ledger-verify ${v.status === 'pass' ? 'pass' : 'fail'}" title="${escAttr(v.run || v.cmd)} — click for output">${label}${escHtml(cmd)}${fix}</span>${ledgerMergeHtml(e)}`;
 }
 
 function ledgerMergeHtml(e) {
@@ -1367,7 +1369,7 @@ function renderLedgerBlock(pane, el, e, key, withDetail) {
     }
   }
   if (verifyOpen && e.verify && e.verify.tail != null) {
-    html += `<div class="cond-ledger-label">${escHtml(e.verify.cmd)}${e.verify.code != null ? ' · exit ' + e.verify.code : ''}</div><pre class="cond-ledger-pre">${escHtml(e.verify.tail || '(no output)')}</pre>`;
+    html += `<div class="cond-ledger-label">${escHtml(e.verify.run || e.verify.cmd)}${e.verify.code != null ? ' · exit ' + e.verify.code : ''}</div><pre class="cond-ledger-pre">${escHtml(e.verify.tail || '(no output)')}</pre>`;
   }
   if (diffOpen) {
     html += !cached ? '<div class="cond-ledger-dim">loading diff…</div>'
@@ -1635,10 +1637,8 @@ function renderCollections() {
               <button class="add-menu-item conductor-btn" data-ci="${ci}"><span class="add-menu-icon">&#x25C9;</span> Conductor</button>
               ${(col.commands || []).map((cmd, cmdI) => `<button class="add-menu-item cmd-btn" data-ci="${ci}" data-cmdi="${cmdI}" title="${escAttr(cmd.cmd)}"><span class="add-menu-icon">&#x26A1;</span> ${escHtml(cmd.name)}</button>`).join('')}
               <button class="add-menu-item addcmd-btn" data-ci="${ci}"><span class="add-menu-icon">+</span> Add command</button>
-              <button class="add-menu-item verify-btn" data-ci="${ci}" title="Run after each background agent finishes, in its worktree"><span class="add-menu-icon">&#x2713;</span> ${col.verify ? 'Verify: ' + escHtml(col.verify) : 'Set verify command'}</button>
+              <button class="add-menu-item verify-btn" data-ci="${ci}" title="Run after each background agent finishes, in its worktree. A FAIL is sent back to the agent to fix (3 attempts); a PASS merges its branch into the default branch (never pushed). Auto: npm test, else node --check on changed JS files"><span class="add-menu-icon">&#x2713;</span> Verify: ${verifyOff(col) ? 'off' : verifyCmd(col) ? escHtml(verifyCmd(col)) : 'auto'}</button>
               <button class="add-menu-item brief-btn" data-ci="${ci}" title="Project facts every background agent reads first (.manifold/agent-brief.md)"><span class="add-menu-icon">&#x2261;</span> Edit agent brief</button>
-              <button class="add-menu-item autofix-btn" data-ci="${ci}" title="When verify fails, send the agent the output and have it fix, re-verify and commit"><span class="add-menu-icon">&#x21bb;</span> ${col.autofix ? `Auto-fix on FAIL: ${col.autofix} attempts${col.verify ? '' : ' (needs verify)'}` : 'Auto-fix on FAIL: off'}</button>
-              <button class="add-menu-item automerge-btn" data-ci="${ci}" title="When verify passes, merge the agent's branch into the default branch of the main working tree (never pushes)"><span class="add-menu-icon">&#x2442;</span> ${col.automerge ? `Auto-merge on PASS: on${col.verify ? '' : ' (needs verify)'}` : 'Auto-merge on PASS: off'}</button>
             </div>
           </div>
         </div>
@@ -1882,10 +1882,6 @@ function bindCollectionEvents() {
       } else if (el.classList.contains('brief-btn')) {
         const col = state.collections[ci];
         if (col) editAgentBrief(col.path, col.remote || null);
-      } else if (el.classList.contains('autofix-btn')) {
-        setCollectionAutofix(ci);
-      } else if (el.classList.contains('automerge-btn')) {
-        toggleCollectionAutomerge(ci);
       }
     });
 
@@ -2188,14 +2184,20 @@ async function addCommandToCollection(ci) {
   saveState();
 }
 
-// Optional per-collection check (e.g. `npm test`) that main runs in a finished
-// agent's worktree; the result lands on its completion notice and ledger entry.
+// Check that main runs in a finished agent's worktree; the result lands on its
+// completion notice and ledger entry, a FAIL goes back to the agent to fix and
+// a PASS is merged. col.verify overrides detection: unset = auto (npm test,
+// else node --check on the changed JS files), 'off' = no verify at all.
+const AUTOFIX_MAX = 3;
+function verifyOff(col) { return !!col && /^off$/i.test((col.verify || '').trim()); }
+function verifyCmd(col) { return col && !verifyOff(col) ? (col.verify || '').trim() : ''; }
+
 async function setCollectionVerify(ci) {
   const col = state.collections[ci];
   if (!col) return;
-  const cmd = await showInputDialog('Verify command (empty to turn off)', 'e.g. npm test', { value: col.verify || '', allowEmpty: true });
+  const cmd = await showInputDialog('Verify command (empty = auto-detect, "off" to disable)', 'auto: npm test, else node --check on changed JS', { value: col.verify || '', allowEmpty: true });
   if (cmd === null) return;
-  col.verify = cmd || null;
+  col.verify = cmd.trim() || null;
   renderCollections();
   saveState();
 }
@@ -2272,28 +2274,6 @@ async function editAgentBrief(cwd, remote) {
       if (p.cwd === cwd && (p.remote || null) === (remote || null)) refreshBrief(p);
     }
   };
-}
-
-// Both act on the verify result, so neither does anything without a verify command.
-async function setCollectionAutofix(ci) {
-  const col = state.collections[ci];
-  if (!col) return;
-  const v = await showInputDialog('Auto-fix on verify FAIL: max attempts per agent (0 or empty to turn off)', '3', { value: String(col.autofix || 3), allowEmpty: true });
-  if (v === null) return;
-  const n = parseInt(v, 10);
-  col.autofix = n > 0 ? Math.min(n, 10) : null;
-  if (col.autofix && !col.verify) showToast('Auto-fix is on, but needs a verify command to act on', true);
-  renderCollections();
-  saveState();
-}
-
-function toggleCollectionAutomerge(ci) {
-  const col = state.collections[ci];
-  if (!col) return;
-  col.automerge = !col.automerge;
-  if (col.automerge) showToast(col.verify ? 'Auto-merge on: verified agent branches merge into the default branch (never pushed)' : 'Auto-merge is on, but merges nothing until a verify command is set', !col.verify);
-  renderCollections();
-  saveState();
 }
 
 // ── Fork session ──
@@ -2601,8 +2581,6 @@ async function saveState() {
       gridded: col.gridded || false,
       commands: col.commands || [],
       verify: col.verify || null,
-      autofix: col.autofix || null,
-      automerge: col.automerge || false,
       tabs: col.tabs.map((t) => ({
         name: t.name,
         cwd: t.cwd,
@@ -3925,8 +3903,6 @@ async function restoreFromState(data) {
       gridded: colData.gridded || false,
       commands: colData.commands || [],
       verify: colData.verify || null,
-      autofix: colData.autofix || null,
-      automerge: colData.automerge || false,
       tabs: [],
     };
 

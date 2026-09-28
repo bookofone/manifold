@@ -60,9 +60,15 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   touched by `claude rm`/clear). `agent-diff` runs one shell script in the agent's cwd (bash
   locally, WSL on Windows, ssh on remote): base is merge-base with the default branch when on
   another branch, else the last commit before the agent started, diffed against the working tree;
-  full diffs are fetched on click, capped at 200KB, never persisted. A collection's optional
-  `verify` command (add menu → "Set verify command") runs via `agent-verify` in the same cwd with a
-  5 min timeout; PASS/FAIL shows on the notice and history entry, and
+  full diffs are fetched on click, capped at 200KB, never persisted. Verify always runs, via
+  `agent-verify` in the same cwd with a 5 min timeout. With no `col.verify` it is auto-detected
+  inside that one script (so local, WSL and ssh alike): a package.json `test` script other than
+  npm init's "no test specified" → `npm test`; else `node --check` on each existing .js/.mjs/.cjs
+  file changed vs the diff base (untracked included, paths `--relative` to cwd); else PASS with
+  "no checks found". The script's first lines `@@MF cmd <label>` / `@@MF run <command>` name
+  what ran; the badge reads e.g. `PASS · node --check (3 files)`. `col.verify` is an override
+  (add menu → "Verify: auto|off|<cmd>"): empty = auto, `off` = no verify (so no fix/merge).
+  PASS/FAIL shows on the notice and history entry, and
   `[Manifold] verify: PASS|FAIL for agent <id>` is queued into the conductor's pending notices.
 - **Agent brief**: `<project>/.manifold/agent-brief.md` holds durable project facts for every
   background agent (this repo's own is committed). Agents get a *pointer*, never the contents:
@@ -73,14 +79,14 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   pane's `+` dispatch prepends the pointer itself. `brief-read`/`brief-write` go over ssh
   (base64 on write) for remote collections. Edited from the add menu ("Edit agent brief") or
   the roster header's `brief` label, which shows whether one is active (re-read per turn).
-  Two more per-collection options in the same menu, off by default, act on that result and do
-  nothing without a verify command. **Auto-fix** (`col.autofix` = max attempts, default 3): on
+  Two behaviours act on the verify result and are always on (no toggles; old saved
+  `col.autofix`/`col.automerge` values are ignored). **Auto-fix** (`AUTOFIX_MAX` = 3 attempts): on
   FAIL the same agent gets the command, exit code and output tail (`agent-send`, else a
   conductor relay) and is told to fix, re-verify, commit and finish; `ledger.autofix.attempts`
   counts rounds and survives the re-record. The pane's `fixing` set keeps the roster polling
   while hidden so the agent's next working→done is seen, which re-runs verify; the FAIL notice
   is only raised once attempts run out ("autofix exhausted"). Line shows `FAIL · fix 2/3`.
-  **Auto-merge** (`col.automerge`): on PASS, `agent-merge` runs `git merge --no-edit <branch>`
+  **Auto-merge**: on PASS (including "no checks found"), `agent-merge` runs `git merge --no-edit <branch>`
   in the repo's main working tree (first `git worktree list` entry), serialised in main. It
   skips with a notice unless the agent tree has no uncommitted tracked changes, the main tree is
   clean (tracked files) and on the default branch, and the branch isn't already merged; a
