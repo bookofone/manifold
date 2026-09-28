@@ -64,6 +64,20 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   `verify` command (add menu → "Set verify command") runs via `agent-verify` in the same cwd with a
   5 min timeout; PASS/FAIL shows on the notice and history entry, and
   `[Manifold] verify: PASS|FAIL for agent <id>` is queued into the conductor's pending notices.
+  Two more per-collection options in the same menu, off by default, act on that result and do
+  nothing without a verify command. **Auto-fix** (`col.autofix` = max attempts, default 3): on
+  FAIL the same agent gets the command, exit code and output tail (`agent-send`, else a
+  conductor relay) and is told to fix, re-verify, commit and finish; `ledger.autofix.attempts`
+  counts rounds and survives the re-record. The pane's `fixing` set keeps the roster polling
+  while hidden so the agent's next working→done is seen, which re-runs verify; the FAIL notice
+  is only raised once attempts run out ("autofix exhausted"). Line shows `FAIL · fix 2/3`.
+  **Auto-merge** (`col.automerge`): on PASS, `agent-merge` runs `git merge --no-edit <branch>`
+  in the repo's main working tree (first `git worktree list` entry), serialised in main. It
+  skips with a notice unless the agent tree has no uncommitted tracked changes, the main tree is
+  clean (tracked files) and on the default branch, and the branch isn't already merged; a
+  conflict is `git merge --abort`ed and `[Manifold] automerge conflict: …` queued. On success the
+  ledger records the sha (`merged <sha>`), `[Manifold] automerged <branch> (<sha>)` is queued
+  and the agent is `claude rm`'d. Never pushes. Same bash/WSL/ssh path as `agent-verify`.
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work

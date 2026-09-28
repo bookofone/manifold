@@ -83,6 +83,7 @@ contextBridge.exposeInMainWorld('manifold', {
   // optional verify command, both run in the agent's cwd (over ssh if remote).
   agentDiff: (opts) => ipcRenderer.invoke('agent-diff', opts),
   agentVerify: (opts) => ipcRenderer.invoke('agent-verify', opts),
+  agentMerge: (opts) => ipcRenderer.invoke('agent-merge', opts),
 
   // UI Scale
   setZoomFactor: (factor) => webFrame.setZoomFactor(factor),

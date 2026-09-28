@@ -1900,6 +1900,51 @@ ipcMain.handle('agent-verify', async (event, { cwd, cmd, remote }) => {
   };
 });
 
+// Auto-merge a verified agent's branch into the repo's main working tree (the
+// first entry of `git worktree list`), which must be clean and on the default
+// branch. Never pushes. A conflict is aborted so the tree is left as it was.
+// Merges are serialised: two agents passing at once would fight over index.lock.
+let mergeChain = Promise.resolve();
+ipcMain.handle('agent-merge', (event, { cwd, branch, remote }) => {
+  const run = mergeChain.then(() => agentMerge(cwd, branch, remote));
+  mergeChain = run.catch(() => {});
+  return run;
+});
+
+async function agentMerge(cwd, branch, remote) {
+  if (!cwd || !branch) return { ok: false, error: 'no cwd or branch' };
+  const dir = remote ? cwd : winToWslPath(cwd);
+  const script = [
+    `cd ${shQuote(dir)} 2>/dev/null || { echo '@@MF skip'; echo 'agent worktree removed'; exit 0; }`,
+    `b=${shQuote(branch)}`,
+    `git rev-parse --verify --quiet "refs/heads/$b" >/dev/null || { echo '@@MF skip'; echo "no local branch $b"; exit 0; }`,
+    `git update-index -q --refresh; git diff-index --quiet HEAD -- || { echo '@@MF skip'; echo 'agent worktree has uncommitted changes'; exit 0; }`,
+    `main=$(git worktree list --porcelain | sed -n '1s/^worktree //p')`,
+    `cd "$main" 2>/dev/null || { echo '@@MF skip'; echo 'main working tree not found'; exit 0; }`,
+    `def=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')`,
+    `[ -n "$def" ] && git rev-parse --verify --quiet "refs/heads/$def" >/dev/null || def=`,
+    `[ -z "$def" ] && for x in main master; do git rev-parse --verify --quiet "refs/heads/$x" >/dev/null && { def=$x; break; }; done`,
+    `[ -z "$def" ] && { echo '@@MF skip'; echo 'no default branch'; exit 0; }`,
+    `[ "$b" = "$def" ] && { echo '@@MF skip'; echo "agent worked on $def itself, nothing to merge"; exit 0; }`,
+    `cur=$(git rev-parse --abbrev-ref HEAD)`,
+    `[ "$cur" = "$def" ] || { echo '@@MF skip'; echo "main working tree is on $cur, not $def"; exit 0; }`,
+    `git update-index -q --refresh; git diff-index --quiet HEAD -- || { echo '@@MF skip'; echo "main working tree has uncommitted changes"; exit 0; }`,
+    `git merge-base --is-ancestor "$b" HEAD && { echo '@@MF skip'; echo "$b is already merged into $def"; exit 0; }`,
+    `if out=$(git merge --no-edit "$b" 2>&1); then echo '@@MF merged'; git rev-parse --short HEAD; echo "$def"; exit 0; fi`,
+    `if [ -n "$(git ls-files -u)" ]; then echo '@@MF conflict'; else echo '@@MF failed'; fi`,
+    `git merge --abort >/dev/null 2>&1`,
+    `echo "$out" | tail -n 20`,
+  ].join('\n');
+
+  const res = await runAgentSh(remote, script, 60000);
+  const m = String(res.stdout || '').match(/^@@MF (\w+)\n?([\s\S]*)/m);
+  if (!m) return { ok: false, error: (res.stderr || 'merge failed to run').trim().slice(0, 300) };
+  const lines = m[2].split('\n');
+  if (m[1] === 'skip') return { ok: true, status: 'skipped', reason: lines[0] };
+  if (m[1] === 'merged') return { ok: true, status: 'merged', sha: lines[0], into: lines[1] };
+  return { ok: true, status: m[1], output: m[2].trim().slice(-VERIFY_TAIL_CHARS) };
+}
+
 // ── App lifecycle ──
 
 app.whenReady().then(() => {
