@@ -96,6 +96,59 @@
                   <button class="seg-btn" data-birth="off">Nothing</button>
                 </div>
               </div>
+              <div class="settings-section-title settings-section-title-sub">MODELS</div>
+              <div class="settings-row-segmented">
+                <div class="settings-segmented-top">
+                  <span class="settings-label">Conductor model</span>
+                  <span class="settings-desc">Applies when a conductor starts or is reopened</span>
+                </div>
+                <div id="conductor-model-seg" class="settings-segmented">
+                  <button class="seg-btn" data-model="haiku">Haiku</button>
+                  <button class="seg-btn" data-model="sonnet">Sonnet</button>
+                  <button class="seg-btn" data-model="opus">Opus</button>
+                  <button class="seg-btn" data-model="fable">Fable</button>
+                </div>
+                <select id="conductor-model-select" class="remote-form-input model-select">
+                  <option value="">Specific version (optional)</option>
+                  <option value="claude-fable-5-1">Fable 5.1</option>
+                  <option value="claude-fable-5">Fable 5</option>
+                  <option value="claude-opus-5-5">Opus 5.5</option>
+                  <option value="claude-opus-5">Opus 5</option>
+                  <option value="claude-opus-4-8">Opus 4.8</option>
+                  <option value="claude-sonnet-5-5">Sonnet 5.5</option>
+                  <option value="claude-sonnet-5">Sonnet 5</option>
+                  <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                  <option value="claude-haiku-4-5">Haiku 4.5</option>
+                  <option value="__other">Other…</option>
+                </select>
+                <input id="conductor-model-custom" type="text" class="remote-form-input model-custom hidden" placeholder="Exact model name" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row-segmented">
+                <div class="settings-segmented-top">
+                  <span class="settings-label">Agent model</span>
+                  <span class="settings-desc">Background agents the conductor dispatches</span>
+                </div>
+                <div id="agent-model-seg" class="settings-segmented">
+                  <button class="seg-btn" data-model="haiku">Haiku</button>
+                  <button class="seg-btn" data-model="sonnet">Sonnet</button>
+                  <button class="seg-btn" data-model="opus">Opus</button>
+                  <button class="seg-btn" data-model="fable">Fable</button>
+                </div>
+                <select id="agent-model-select" class="remote-form-input model-select">
+                  <option value="">Specific version (optional)</option>
+                  <option value="claude-fable-5-1">Fable 5.1</option>
+                  <option value="claude-fable-5">Fable 5</option>
+                  <option value="claude-opus-5-5">Opus 5.5</option>
+                  <option value="claude-opus-5">Opus 5</option>
+                  <option value="claude-opus-4-8">Opus 4.8</option>
+                  <option value="claude-sonnet-5-5">Sonnet 5.5</option>
+                  <option value="claude-sonnet-5">Sonnet 5</option>
+                  <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                  <option value="claude-haiku-4-5">Haiku 4.5</option>
+                  <option value="__other">Other…</option>
+                </select>
+                <input id="agent-model-custom" type="text" class="remote-form-input model-custom hidden" placeholder="Exact model name" autocomplete="off" spellcheck="false">
+              </div>
             </section>
             <section class="settings-pane" data-pane="remotes">
               <div class="settings-section-title">REMOTE DESTINATIONS</div>

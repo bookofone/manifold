@@ -31,6 +31,40 @@ function winToWslPath(winPath) {
   return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
 }
 
+// The reverse, for paths Claude reports from inside WSL (an agent's cwd).
+function wslToWinPath(p) {
+  if (!p || !IS_WIN) return p;
+  const m = p.match(new RegExp('^/mnt/([a-z])(?:/(.*))?$'));
+  return m ? path.win32.join(m[1].toUpperCase() + ':', path.win32.sep, m[2] || '') : p;
+}
+
+// On Windows every Claude session lives in WSL, so its ~/.claude is the WSL
+// home, reached from this side as a wsl.localhost UNC path.
+let wslHomeCache;
+function claudeHome() {
+  if (!IS_WIN) return os.homedir();
+  if (wslHomeCache === undefined) {
+    wslHomeCache = null;
+    try {
+      const r = require('child_process').spawnSync('wsl.exe', ['-e', 'sh', '-c', 'wslpath -w ~'], { encoding: 'utf-8', timeout: 10000 });
+      const out = (r.stdout || '').trim();
+      if (r.status === 0 && out) wslHomeCache = out;
+    } catch (_) {}
+  }
+  return wslHomeCache || os.homedir();
+}
+
+// argv for wsl.exe that runs `bin args` in `dir`. Plain `wsl.exe bin args`
+// hands the line to a shell, which mangles a multi-line system prompt or any
+// task text with quotes in it. base64 carries the quoted script through both
+// the Windows command line and that shell untouched.
+function wslArgv(bin, dir, args, env) {
+  const cd = dir ? `cd ${shQuote(winToWslPath(dir))} && ` : '';
+  const script = `${cd}${envAssign(env)}exec ${shQuote(bin)} ${args.map(shQuote).join(' ')}`;
+  const b64 = Buffer.from(script, 'utf-8').toString('base64');
+  return ['-e', 'bash', '-lc', `eval "$(echo ${b64} | base64 -d)"`];
+}
+
 function getToolCmd() {
   return process.env.MANIFOLD_CMD || TOOL_CMD;
 }
@@ -138,8 +172,14 @@ const REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/
 
 // bash -lc so the remote gets a login environment. Every argument is quoted
 // individually, which is what lets --append-system-prompt stay multi-line.
-function remoteClaudeCmd(remotePath, args) {
-  const inner = `${REMOTE_PATH} cd ${shQuote(remotePath)} && exec claude ${args.map(shQuote).join(' ')}`;
+// `env` is a few extra variables set for claude only, e.g. the model its own
+// `claude --bg` children should default to.
+function envAssign(env) {
+  return Object.entries(env || {}).map(([k, v]) => `${k}=${shQuote(v)} `).join('');
+}
+
+function remoteClaudeCmd(remotePath, args, env) {
+  const inner = `${REMOTE_PATH} cd ${shQuote(remotePath)} && ${envAssign(env)}exec claude ${args.map(shQuote).join(' ')}`;
   return `bash -lc ${shQuote(inner)}`;
 }
 
@@ -294,7 +334,8 @@ function attemptSshReconnect(id, sshParams, attempt) {
 
 ipcMain.handle('terminal-create', (event, { id, cwd, conversationId, name, collectionName, prompt, shell: shellOnly, cmd: customCmd, provider, sessionId, resume, remote }) => {
   const home = os.homedir();
-  const dir = cwd || home;
+  // An attach tab is opened on the agent's own cwd, which WSL reports as /mnt/c/…
+  const dir = (remote ? cwd : wslToWinPath(cwd)) || home;
 
   const cleanEnv = { ...process.env, HOME: home };
   delete cleanEnv.CLAUDECODE;
@@ -629,8 +670,9 @@ ipcMain.handle('terminal-get-conversation-id', (event, { id }) => {
 // ── Conversation tracking helpers ──
 
 function getProjectDir(cwd) {
-  const encoded = cwd.replace(/[^a-zA-Z0-9_-]/g, '-');
-  return path.join(os.homedir(), '.claude', 'projects', encoded);
+  // Claude encodes the path it actually ran in — on Windows, the WSL one.
+  const encoded = winToWslPath(cwd).replace(/[^a-zA-Z0-9_-]/g, '-');
+  return path.join(claudeHome(), '.claude', 'projects', encoded);
 }
 
 function listConversations(projectDir) {
@@ -1127,7 +1169,14 @@ ipcMain.handle('claude-update', async () => {
 // The conductor also gets an addressable session name so dispatched agents can
 // message it back when they finish, instead of the work completing silently and
 // only surfacing when the user thinks to ask.
-function conductorPrompt(selfName, remote) {
+// Models come from Settings. Anything else is dropped rather than handed to a
+// shell and a system prompt: aliases (fable, opus, sonnet, haiku) or full ids.
+const MODEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,63}$/;
+function cleanModel(m, fallback) {
+  return typeof m === 'string' && MODEL_RE.test(m) ? m : fallback;
+}
+
+function conductorPrompt(selfName, remote, agentModel) {
   return [
     'You are the conductor of a Manifold workspace.',
     '',
@@ -1145,9 +1194,10 @@ function conductorPrompt(selfName, remote) {
     'You do not do heavy work yourself. Your job is to stay responsive and delegate:',
     '',
     '- Dispatch background work with:',
-    '    claude --bg --dangerously-skip-permissions "<full self-contained prompt>"',
-    '  The flag is required: without it the agent stalls on approval prompts that',
-    '  nobody can answer.',
+    '    claude --bg --dangerously-skip-permissions --model ' + agentModel + ' "<full self-contained prompt>"',
+    '  The permissions flag is required: without it the agent stalls on approval',
+    '  prompts that nobody can answer. The model is the user\'s choice for agents;',
+    '  keep it unless the user explicitly asks for a different model for a task.',
     '  Run it with cwd set to the project directory. It returns a short session id.',
     '  ALWAYS append this sentence to a dispatched prompt, so the work reports back',
     '  instead of finishing silently:',
@@ -1177,7 +1227,13 @@ function conductorPrompt(selfName, remote) {
   ].join('\n');
 }
 
-ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, name, remote }) => {
+ipcMain.handle('conductor-create', async (event, { id, cwd, model: rawModel, agentModel: rawAgentModel, sessionId, name, remote }) => {
+  const model = cleanModel(rawModel, 'sonnet');
+  const agentModel = cleanModel(rawAgentModel, 'sonnet');
+  // Every `claude` the conductor runs inherits this, so an agent it dispatches
+  // lands on the chosen model even if the --model flag is left off. The
+  // conductor's own --model flag outranks it.
+  const childEnv = { ANTHROPIC_MODEL: agentModel };
   // A remote conductor runs the remote host's own `claude`, so the local probe
   // says nothing about whether it will work.
   let bin = null;
@@ -1225,10 +1281,10 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--verbose',
-      '--model', model || 'sonnet',
+      '--model', model,
       '--name', selfName,
       '--dangerously-skip-permissions',
-      '--append-system-prompt', conductorPrompt(selfName, remote || null),
+      '--append-system-prompt', conductorPrompt(selfName, remote || null, agentModel),
     ];
     // Resuming reuses the same session id and carries the conversation, so a
     // restarted conductor still remembers what was said.
@@ -1237,8 +1293,10 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model, sessionId, na
     // Remote: one ssh carrying the same argv, quoted for the far shell. stdin
     // and stdout are ordinary pipes either way, so everything below is shared.
     const proc = remote
-      ? spawnSsh(remote, remoteClaudeCmd(dir, args), { env: process.env })
-      : spawn(bin, args, { cwd: dir, env: claudeEnv() });
+      ? spawnSsh(remote, remoteClaudeCmd(dir, args, childEnv), { env: process.env })
+      : IS_WIN
+        ? spawn('wsl.exe', wslArgv(bin, dir, args, childEnv), { env: claudeEnv() })
+        : spawn(bin, args, { cwd: dir, env: { ...claudeEnv(), ...childEnv } });
     let sawInit = false;
     let stderrTail = '';
 
@@ -1502,13 +1560,15 @@ async function runClaude(remote, cwd, args, timeout) {
   }
   const bin = await findClaudeBin();
   if (!bin) return { ok: false, stdout: '', stderr: 'Claude Code CLI not found' };
+  // runCmd prepends wsl.exe on Windows; '-e' makes it exec the quoted script.
+  if (IS_WIN) return runCmd('-e', wslArgv(bin, cwd, args).slice(1), { env: claudeEnv(), timeout });
   return runCmd(bin, args, { cwd: cwd || os.homedir(), env: claudeEnv(), timeout });
 }
 
 ipcMain.handle('agents-list', async (event, { cwd, remote }) => {
   // --cwd scopes the listing to sessions started under this collection's path.
   const args = ['agents', '--json'];
-  if (cwd) args.push('--cwd', cwd);
+  if (cwd) args.push('--cwd', remote ? cwd : winToWslPath(cwd));
 
   const res = await runClaude(remote, cwd, args, 10000);
   if (!res.ok) return { ok: false, error: res.stderr || 'agents --json failed' };
@@ -1524,7 +1584,8 @@ ipcMain.handle('agent-dispatch', async (event, { cwd, prompt, model, remote }) =
   // rejected ("the job would be unattachable"), which is the whole point here —
   // a dispatched agent has to stay attachable.
   const args = ['--bg', '--dangerously-skip-permissions', prompt];
-  if (model) args.push('--model', model);
+  const m = cleanModel(model, null);
+  if (m) args.push('--model', m);
 
   const res = await runClaude(remote, cwd, args, 30000);
   if (!res.ok) return { ok: false, error: res.stderr || 'dispatch failed' };
@@ -1659,7 +1720,7 @@ ipcMain.handle('agent-transcript', async (event, { sessionId, cwd, remote }) => 
 // message for review instead of acting on it. There is no ack on the socket;
 // the renderer confirms delivery by finding the text in the transcript.
 function agentInbox(pid, sessionId) {
-  const dir = path.join(os.homedir(), '.claude', 'sessions');
+  const dir = path.join(claudeHome(), '.claude', 'sessions');
   let meta;
   try { meta = JSON.parse(fs.readFileSync(path.join(dir, `${pid}.json`), 'utf-8')); } catch (_) {}
   if (!meta || meta.sessionId !== sessionId) throw new Error('session is not running');

@@ -1958,3 +1958,22 @@ body {
 .cond-msg-relay .cond-msg-from { color: #1a1a1a; }
 .cond-msg-relay-failed { opacity: 1; background: #3a2526; color: #e5484d; }
 .cond-msg-relay-failed .cond-msg-from { color: #e5484d; }
+
+/* Exact model version / name under the model aliases */
+.model-select,
+.model-custom {
+  margin-top: 8px;
+}
+.model-select {
+  cursor: pointer;
+}
+.model-select option {
+  background: #1a1a1a;
+  color: #d0d0d0;
+}
+.model-custom.hidden {
+  display: none;
+}
+.model-custom.invalid {
+  border-color: #a44;
+}

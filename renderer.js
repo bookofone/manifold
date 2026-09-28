@@ -25,6 +25,10 @@ const state = {
   // 'catchup' — resumed ones catch up, fresh ones stay quiet
   // 'off'     — never speak first
   conductorBirth: 'orient',
+  // Models, as `claude --model` aliases. Read when a conductor (re)starts, so a
+  // change reaches an open conductor the next time its tab is reopened.
+  conductorModel: 'sonnet',
+  agentModel: 'sonnet', // background agents, whether dispatched by the conductor or the button
 };
 
 // Terminal instances: tabId -> { terminal, fitAddon, element }
@@ -474,7 +478,7 @@ async function startConductor(pane, name) {
   const where = pane.remote ? `${pane.cwd} on ${pane.remote}` : pane.cwd;
   condSysLine(pane, pane.sessionId ? 'Resuming conductor…' : `Starting conductor in ${where}…`);
   const res = await manifold.conductorCreate({
-    id: pane.tabId, cwd: pane.cwd, model: 'sonnet',
+    id: pane.tabId, cwd: pane.cwd, model: state.conductorModel, agentModel: state.agentModel,
     sessionId: pane.sessionId, name: pane.selfName, remote: pane.remote,
   });
   if (!res || !res.ok) {
@@ -1185,7 +1189,7 @@ async function dispatchAgentPrompt(pane) {
   const prompt = await showInputDialog('Dispatch background agent', 'Self-contained task for the agent...');
   if (!prompt) return;
   condSysLine(pane, `Dispatching: ${prompt.slice(0, 80)}…`);
-  const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: 'sonnet', remote: pane.remote });
+  const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: state.agentModel, remote: pane.remote });
   if (!res || !res.ok) {
     condSysLine(pane, `Dispatch failed: ${(res && res.error) || '?'}`, true);
     return;
@@ -2151,6 +2155,8 @@ async function saveState() {
     uiScale: parseInt(scaleSlider.value) || 100,
     defaultSource: state.defaultSource,
     conductorBirth: state.conductorBirth,
+    conductorModel: state.conductorModel,
+    agentModel: state.agentModel,
     remotes: state.remotes,
   };
   await manifold.saveState(data);
@@ -2734,6 +2740,56 @@ conductorBirthSeg.querySelectorAll('.seg-btn').forEach((btn) => {
     saveState();
   });
 });
+
+// Conductor / agent models. The buttons are aliases that follow the newest
+// model of each family; the dropdown pins an exact version; "Other…" opens a
+// text field for any name the CLI accepts (claude-opus-5-5, sonnet[1m], …).
+const MODEL_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,63}$/;
+function wireModelSeg(base, key) {
+  const seg = document.getElementById(base + '-seg');
+  const select = document.getElementById(base + '-select');
+  const input = document.getElementById(base + '-custom');
+  const aliases = [...seg.querySelectorAll('.seg-btn')].map((b) => b.dataset.model);
+  const versions = [...select.options].map((o) => o.value).filter((v) => v && v !== '__other');
+  const set = (v) => { state[key] = v; saveState(); };
+  const render = () => {
+    const v = state[key];
+    seg.querySelectorAll('.seg-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.model === v));
+    const other = !aliases.includes(v) && !versions.includes(v);
+    select.value = aliases.includes(v) ? '' : other ? '__other' : v;
+    input.classList.toggle('hidden', !other);
+    if (document.activeElement !== input) input.value = other ? v : '';
+    input.classList.remove('invalid');
+  };
+  seg.querySelectorAll('.seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => { set(btn.dataset.model); render(); });
+  });
+  select.addEventListener('change', () => {
+    if (select.value === '__other') {
+      input.classList.remove('hidden');
+      input.value = '';
+      input.focus();
+      return;
+    }
+    set(select.value || 'sonnet');
+    render();
+  });
+  input.addEventListener('input', () => {
+    const v = input.value.trim();
+    if (!v) return;
+    if (!MODEL_NAME_RE.test(v)) { input.classList.add('invalid'); return; }
+    input.classList.remove('invalid');
+    set(v);
+    seg.querySelectorAll('.seg-btn').forEach((btn) => btn.classList.remove('active'));
+  });
+  input.addEventListener('blur', () => {
+    if (!input.value.trim() && !aliases.includes(state[key]) && !versions.includes(state[key])) set('sonnet');
+    render();
+  });
+  return render;
+}
+const renderConductorModel = wireModelSeg('conductor-model', 'conductorModel');
+const renderAgentModel = wireModelSeg('agent-model', 'agentModel');
 
 // ── UI Scale slider ──
 const scaleSlider = document.getElementById('scale-slider');
@@ -3459,6 +3515,10 @@ async function restoreFromState(data) {
       state.conductorBirth = savedState.conductorBirth;
     }
     renderConductorBirth();
+    if (savedState && savedState.conductorModel) state.conductorModel = savedState.conductorModel;
+    if (savedState && savedState.agentModel) state.agentModel = savedState.agentModel;
+    renderConductorModel();
+    renderAgentModel();
     // Restore remote destinations
     if (savedState && savedState.remotes) {
       state.remotes = savedState.remotes;
