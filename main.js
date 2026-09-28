@@ -1176,7 +1176,7 @@ function cleanModel(m, fallback) {
   return typeof m === 'string' && MODEL_RE.test(m) ? m : fallback;
 }
 
-function conductorPrompt(selfName, remote, agentModel) {
+function conductorPrompt(selfName, remote, agentModel, briefFile) {
   return [
     'You are the conductor of a Manifold workspace.',
     '',
@@ -1203,6 +1203,15 @@ function conductorPrompt(selfName, remote, agentModel) {
     '  instead of finishing silently:',
     '    "When you are completely finished, use SendMessage to send a one-paragraph',
     '     summary of what you did to the session named ' + selfName + '."',
+    '- Agent brief: before each dispatch, check whether ' + briefFile + ' exists.',
+    '  If it does, the dispatched prompt must BEGIN with this exact line (a pointer,',
+    '  not the file contents \u2014 the agent reads it itself; the absolute path',
+    '  matters because an agent in a git worktree may not have the file):',
+    '    "Read ' + briefFile + ' first and follow it."',
+    '  The brief holds durable project facts every agent needs (how to build and',
+    '  test, style rules, git rules). When an agent reports a durable fact that',
+    '  future agents would otherwise rediscover, append it to the brief concisely',
+    '  (create the file if missing). Never delete or rewrite what is already there.',
     '- Inspect running work with the ListAgents tool, or claude agents --json.',
     '  States: working (busy), done (finished), blocked (asked a question and is',
     '  waiting on a human \u2014 it will never continue on its own; tell the user),',
@@ -1226,6 +1235,52 @@ function conductorPrompt(selfName, remote, agentModel) {
     'conversation.',
   ].join('\n');
 }
+
+// ── Agent brief ──
+//
+// <project>/.manifold/agent-brief.md: durable project facts for every
+// background agent. Agents are pointed at it rather than handed its contents,
+// by absolute path so an agent in a git worktree still finds it. The path is
+// the one the agent sees: WSL on Windows, the remote host's own path over ssh.
+const BRIEF_REL = '.manifold/agent-brief.md';
+function briefAgentPath(cwd, remote) {
+  if (remote) return !cwd || cwd === '.' ? BRIEF_REL : cwd.replace(/\/+$/, '') + '/' + BRIEF_REL;
+  return winToWslPath(cwd).replace(/[\/\\]+$/, '') + '/' + BRIEF_REL;
+}
+
+ipcMain.handle('brief-read', async (event, { cwd, remote }) => {
+  if (!cwd) return { ok: false, error: 'no project directory' };
+  const agentPath = briefAgentPath(cwd, remote);
+  if (remote) {
+    const res = await runRemoteCmd(remote, `cd ${shQuote(cwd)} && { if [ -f ${BRIEF_REL} ]; then echo '@@MF yes'; cat ${BRIEF_REL}; else echo '@@MF no'; fi; }`, { timeout: 15000 });
+    const out = String(res.stdout || '');
+    const m = out.match(/^@@MF (yes|no)\n?/m);
+    if (!m) return { ok: false, error: (res.stderr || 'could not reach remote host').trim().slice(0, 300) };
+    const text = out.slice(m.index + m[0].length);
+    return { ok: true, exists: m[1] === 'yes' && !!text.trim(), text, agentPath };
+  }
+  const file = path.join(cwd, BRIEF_REL);
+  if (!fs.existsSync(file)) return { ok: true, exists: false, text: '', agentPath };
+  try { const text = fs.readFileSync(file, 'utf-8'); return { ok: true, exists: !!text.trim(), text, agentPath }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('brief-write', async (event, { cwd, remote, text }) => {
+  if (!cwd) return { ok: false, error: 'no project directory' };
+  if (remote) {
+    // base64 so the text needs no quoting and survives any content.
+    const b64 = Buffer.from(String(text), 'utf-8').toString('base64');
+    const res = await runRemoteCmd(remote, `cd ${shQuote(cwd)} && mkdir -p .manifold && echo ${b64} | base64 -d > ${BRIEF_REL}`, { timeout: 15000 });
+    return res.ok ? { ok: true } : { ok: false, error: (res.stderr || 'write failed').trim().slice(0, 300) };
+  }
+  try {
+    fs.mkdirSync(path.join(cwd, '.manifold'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, BRIEF_REL), String(text), 'utf-8');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
 
 ipcMain.handle('conductor-create', async (event, { id, cwd, model: rawModel, agentModel: rawAgentModel, sessionId, name, remote }) => {
   const model = cleanModel(rawModel, 'sonnet');
@@ -1284,7 +1339,7 @@ ipcMain.handle('conductor-create', async (event, { id, cwd, model: rawModel, age
       '--model', model,
       '--name', selfName,
       '--dangerously-skip-permissions',
-      '--append-system-prompt', conductorPrompt(selfName, remote || null, agentModel),
+      '--append-system-prompt', conductorPrompt(selfName, remote || null, agentModel, briefAgentPath(dir, remote)),
     ];
     // Resuming reuses the same session id and carries the conversation, so a
     // restarted conductor still remembers what was said.

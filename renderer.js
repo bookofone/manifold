@@ -371,6 +371,7 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
     <div class="cond-roster">
       <div class="cond-roster-head">
         <span class="cond-roster-title">SUBCONSCIOUS</span>
+        <button class="cond-brief" title="Agent brief (.manifold/agent-brief.md) — click to edit">no brief</button>
         <button class="cond-done-toggle hidden" title="Show or hide finished agents"></button>
         <button class="cond-clear-btn" title="Delete every finished agent">clear</button>
         <button class="cond-dispatch-btn" title="Dispatch a background agent">+</button>
@@ -425,6 +426,9 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
     ledgerNotices: new Map(),
     ledgerOpen: new Set(),
     diffCache: new Map(),
+    // Path agents see for .manifold/agent-brief.md, or null when there is none.
+    brief: null,
+    briefEl: el.querySelector('.cond-brief'),
   };
   conductorPanes.set(tabId, pane);
 
@@ -460,6 +464,7 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
   });
 
   el.querySelector('.cond-dispatch-btn').addEventListener('click', () => dispatchAgentPrompt(pane));
+  pane.briefEl.addEventListener('click', () => editAgentBrief(pane.cwd, pane.remote));
   el.querySelector('.cond-clear-btn').addEventListener('click', () => clearFinishedAgents(pane));
   el.querySelector('.cond-done-toggle').addEventListener('click', () => {
     pane.showDone = !pane.showDone;
@@ -477,6 +482,7 @@ function createConductorPane(tabId, cwd, name, sessionId = null, selfName = null
   if (sessionId) replayConductorHistory(pane, sessionId);
   startConductor(pane, name);
   refreshRoster(pane);
+  refreshBrief(pane);
 
   return { terminal: null, fitAddon: null, element: el };
 }
@@ -719,8 +725,10 @@ manifold.onConductorEvent((tabId, msg) => {
       pane.busy = false;
       setConductorBusy(pane, false);
       if (msg.is_error) condSysLine(pane, `Turn failed: ${msg.subtype || 'error'}`, true);
-      // A turn finishing is the cue to re-check what the subconscious is doing.
+      // A turn finishing is the cue to re-check what the subconscious is doing,
+      // and whether the conductor wrote to the brief.
       refreshRoster(pane);
+      refreshBrief(pane);
       drainConductorQueue(pane);
       break;
 
@@ -1406,8 +1414,11 @@ function attachAgentTab(pane, agent) {
 }
 
 async function dispatchAgentPrompt(pane) {
-  const prompt = await showInputDialog('Dispatch background agent', 'Self-contained task for the agent...');
+  let prompt = await showInputDialog('Dispatch background agent', 'Self-contained task for the agent...');
   if (!prompt) return;
+  // Same pointer the conductor is told to prepend (see conductorPrompt in main).
+  await refreshBrief(pane);
+  if (pane.brief) prompt = `Read ${pane.brief} first and follow it.\n\n${prompt}`;
   condSysLine(pane, `Dispatching: ${prompt.slice(0, 80)}…`);
   const res = await manifold.agentDispatch({ cwd: pane.cwd, prompt, model: state.agentModel, remote: pane.remote });
   if (!res || !res.ok) {
@@ -1516,6 +1527,7 @@ function renderCollections() {
               ${(col.commands || []).map((cmd, cmdI) => `<button class="add-menu-item cmd-btn" data-ci="${ci}" data-cmdi="${cmdI}" title="${escAttr(cmd.cmd)}"><span class="add-menu-icon">&#x26A1;</span> ${escHtml(cmd.name)}</button>`).join('')}
               <button class="add-menu-item addcmd-btn" data-ci="${ci}"><span class="add-menu-icon">+</span> Add command</button>
               <button class="add-menu-item verify-btn" data-ci="${ci}" title="Run after each background agent finishes, in its worktree"><span class="add-menu-icon">&#x2713;</span> ${col.verify ? 'Verify: ' + escHtml(col.verify) : 'Set verify command'}</button>
+              <button class="add-menu-item brief-btn" data-ci="${ci}" title="Project facts every background agent reads first (.manifold/agent-brief.md)"><span class="add-menu-icon">&#x2261;</span> Edit agent brief</button>
             </div>
           </div>
         </div>
@@ -1756,6 +1768,9 @@ function bindCollectionEvents() {
         addCommandToCollection(ci);
       } else if (el.classList.contains('verify-btn')) {
         setCollectionVerify(ci);
+      } else if (el.classList.contains('brief-btn')) {
+        const col = state.collections[ci];
+        if (col) editAgentBrief(col.path, col.remote || null);
       }
     });
 
@@ -2068,6 +2083,80 @@ async function setCollectionVerify(ci) {
   col.verify = cmd || null;
   renderCollections();
   saveState();
+}
+
+// Agent brief: <project>/.manifold/agent-brief.md, read by every background
+// agent before it starts. The conductor is told to point its dispatches at it
+// and may append to it; the manual dispatch button prepends the same pointer.
+async function refreshBrief(pane) {
+  const res = await manifold.briefRead({ cwd: pane.cwd, remote: pane.remote }).catch(() => null);
+  if (!res || !res.ok) return; // unreachable remote: keep whatever we last knew
+  pane.brief = res.exists ? res.agentPath : null;
+  pane.briefEl.textContent = pane.brief ? 'brief' : 'no brief';
+  pane.briefEl.classList.toggle('on', !!pane.brief);
+  pane.briefEl.title = pane.brief
+    ? `Agent brief active — every dispatch starts with "Read ${pane.brief} first". Click to edit.`
+    : 'No agent brief (.manifold/agent-brief.md) — click to write one';
+}
+
+async function editAgentBrief(cwd, remote) {
+  if (!cwd) return;
+  const overlay = document.getElementById('brief-dialog-overlay');
+  const titleEl = document.getElementById('brief-dialog-title');
+  const field = document.getElementById('brief-dialog-field');
+  const status = document.getElementById('brief-dialog-status');
+  const okBtn = document.getElementById('brief-dialog-ok');
+  const cancelBtn = document.getElementById('brief-dialog-cancel');
+
+  titleEl.textContent = `Agent brief — ${remote ? remote.split(/\s+/).pop() + ':' : ''}${cwd.replace(/[\/\\]+$/, '')}/.manifold/agent-brief.md`;
+  field.value = '';
+  field.disabled = true;
+  okBtn.disabled = true;
+  status.className = '';
+  status.textContent = remote ? 'Reading over ssh…' : 'Reading…';
+  overlay.classList.remove('hidden');
+
+  const close = () => {
+    overlay.classList.add('hidden');
+    okBtn.onclick = cancelBtn.onclick = overlay.onclick = field.onkeydown = null;
+  };
+  cancelBtn.onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  field.onkeydown = (e) => {
+    e.stopPropagation(); // don't let app shortcuts eat ordinary typing
+    if (e.key === 'Escape') close();
+    if (e.key === 's' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); okBtn.click(); }
+  };
+
+  const res = await manifold.briefRead({ cwd, remote }).catch((err) => ({ ok: false, error: String(err) }));
+  if (overlay.classList.contains('hidden')) return;
+  if (!res || !res.ok) {
+    status.className = 'error';
+    status.textContent = `Could not read the brief: ${(res && res.error) || '?'}`;
+    return;
+  }
+  field.value = res.text || '';
+  field.disabled = false;
+  okBtn.disabled = false;
+  status.textContent = 'Agents are pointed at this file on every dispatch. Ctrl+S saves.';
+  field.focus();
+
+  okBtn.onclick = async () => {
+    okBtn.disabled = true;
+    status.textContent = 'Saving…';
+    const w = await manifold.briefWrite({ cwd, remote, text: field.value }).catch((err) => ({ ok: false, error: String(err) }));
+    if (!w || !w.ok) {
+      okBtn.disabled = false;
+      status.className = 'error';
+      status.textContent = `Save failed: ${(w && w.error) || '?'}`;
+      return;
+    }
+    close();
+    showToast('Agent brief saved');
+    for (const [, p] of conductorPanes) {
+      if (p.cwd === cwd && (p.remote || null) === (remote || null)) refreshBrief(p);
+    }
+  };
 }
 
 // ── Fork session ──

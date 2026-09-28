@@ -64,6 +64,15 @@ An Electron app that runs multiple Claude Code sessions in parallel with collect
   `verify` command (add menu → "Set verify command") runs via `agent-verify` in the same cwd with a
   5 min timeout; PASS/FAIL shows on the notice and history entry, and
   `[Manifold] verify: PASS|FAIL for agent <id>` is queued into the conductor's pending notices.
+- **Agent brief**: `<project>/.manifold/agent-brief.md` holds durable project facts for every
+  background agent (this repo's own is committed). Agents get a *pointer*, never the contents:
+  `Read <abs path>/.manifold/agent-brief.md first and follow it.` as the first line of the
+  prompt — absolute because a worktree lacks the file if it is untracked, and in the path the
+  agent sees (WSL on Windows, the remote's own path). `conductorPrompt` tells the conductor to
+  check for the file before each dispatch and to append durable facts from agent reports; the
+  pane's `+` dispatch prepends the pointer itself. `brief-read`/`brief-write` go over ssh
+  (base64 on write) for remote collections. Edited from the add menu ("Edit agent brief") or
+  the roster header's `brief` label, which shows whether one is active (re-read per turn).
 - **Permissions**: every Claude session Manifold spawns — pty tabs, the conductor and
   dispatched agents — runs with `--dangerously-skip-permissions`. Allowlisting the conductor
   was tried and reverted: `Bash(claude *)` does not match compound commands, so routine work

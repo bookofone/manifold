@@ -83,6 +83,10 @@ contextBridge.exposeInMainWorld('manifold', {
   // optional verify command, both run in the agent's cwd (over ssh if remote).
   agentDiff: (opts) => ipcRenderer.invoke('agent-diff', opts),
   agentVerify: (opts) => ipcRenderer.invoke('agent-verify', opts),
+  // <project>/.manifold/agent-brief.md, over ssh when remote. Read also returns
+  // the path agents see, for the pointer line prepended to a dispatch.
+  briefRead: (opts) => ipcRenderer.invoke('brief-read', opts),
+  briefWrite: (opts) => ipcRenderer.invoke('brief-write', opts),
 
   // UI Scale
   setZoomFactor: (factor) => webFrame.setZoomFactor(factor),

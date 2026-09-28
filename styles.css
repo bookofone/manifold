@@ -878,13 +878,13 @@ body {
 #input-dialog-field:focus {
   border-color: #D97757;
 }
-#input-dialog-btns {
+#input-dialog-btns, #brief-dialog-btns {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 12px;
 }
-#input-dialog-btns button {
+#input-dialog-btns button, #brief-dialog-btns button {
   background: #333;
   border: none;
   border-radius: 4px;
@@ -894,7 +894,7 @@ body {
   padding: 6px 14px;
   cursor: pointer;
 }
-#input-dialog-btns button:hover {
+#input-dialog-btns button:hover, #brief-dialog-btns button:hover {
   background: #444;
 }
 #input-dialog-ok {
@@ -904,6 +904,50 @@ body {
 #input-dialog-ok:hover {
   background: #e08867 !important;
 }
+
+/* ── Agent brief editor: same look as the input dialog, with a textarea ── */
+#brief-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+#brief-dialog {
+  background: #222;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 16px 20px;
+  width: min(640px, 90vw);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+#brief-dialog-title {
+  font-size: 13px;
+  color: #999;
+  margin-bottom: 10px;
+  word-break: break-all;
+}
+#brief-dialog-field {
+  width: 100%;
+  height: min(420px, 60vh);
+  resize: vertical;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #d0d0d0;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  outline: none;
+}
+#brief-dialog-field:focus { border-color: #D97757; }
+#brief-dialog-status { font-size: 11px; color: #6a6a6a; margin-top: 6px; min-height: 14px; }
+#brief-dialog-status.error { color: #e5484d; }
+#brief-dialog-ok { background: #D97757 !important; color: #1a1a1a !important; }
+#brief-dialog-ok:hover { background: #e08867 !important; }
 
 /* ── Remote destinations (settings) ── */
 .settings-remotes-list {
@@ -1863,6 +1907,19 @@ body {
   cursor: pointer;
 }
 .cond-agent-btn:hover { background: #333; color: #D97757; }
+
+/* Roster header: whether this collection has an agent brief; click to edit. */
+.cond-brief {
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 10px;
+  color: #444;
+  padding: 0 0 0 8px;
+  cursor: pointer;
+}
+.cond-brief.on { color: #8a5a47; }
+.cond-brief:hover { color: #D97757; }
 
 /* Roster header: clear-finished sits next to dispatch. */
 .cond-clear-btn {
