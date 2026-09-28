@@ -2990,10 +2990,23 @@ function wireModelSeg(base, key) {
   const input = document.getElementById(base + '-custom');
   const aliases = [...seg.querySelectorAll('.seg-btn')].map((b) => b.dataset.model);
   const versions = [...select.options].map((o) => o.value).filter((v) => v && v !== '__other');
-  const set = (v) => { state[key] = v; saveState(); };
+  const set = (v) => {
+    // Open conductors had the agent model baked into their system prompt at
+    // start; tell them about a change so it applies without a reopen.
+    if (key === 'agentModel' && v !== state[key]) {
+      for (const [, p] of conductorPanes) {
+        p.pendingNotices = p.pendingNotices.filter((n) => !n.startsWith('[Manifold] Agent model'));
+        p.pendingNotices.push(`[Manifold] Agent model changed: dispatch background agents with --model ${v} from now on.`);
+      }
+    }
+    state[key] = v;
+    saveState();
+  };
   const render = () => {
     const v = state[key];
-    seg.querySelectorAll('.seg-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.model === v));
+    // A pinned version (claude-opus-5-5, sonnet[1m]) lights its family's button.
+    const family = (a) => v === a || v.startsWith('claude-' + a + '-') || v.startsWith(a + '[');
+    seg.querySelectorAll('.seg-btn').forEach((btn) => btn.classList.toggle('active', family(btn.dataset.model)));
     const other = !aliases.includes(v) && !versions.includes(v);
     select.value = aliases.includes(v) ? '' : other ? '__other' : v;
     input.classList.toggle('hidden', !other);
